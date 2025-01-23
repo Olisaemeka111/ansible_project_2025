@@ -1,0 +1,6 @@
+aws_region: us-west-2
+instance_type: t2.micro
+ami_id: ami-0abcdef1234567890
+key_name: mykeypair
+security_group: mysecuritygroup
+vpc_id: vpc-0abcdef1234567890

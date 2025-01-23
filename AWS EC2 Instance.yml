@@ -1,0 +1,59 @@
+---
+- name: Provision AWS EC2 Instance
+  hosts: localhost
+  gather_facts: no
+  vars:
+    aws_region: us-west-2
+    instance_type: t2.micro
+    ami_id: ami-0abcdef1234567890
+    key_name: mykeypair
+    security_group: mysecuritygroup
+  tasks:
+    - name: Launch EC2 Instance
+      ec2:
+        region: "{{ aws_region }}"
+        instance_type: "{{ instance_type }}"
+        image: "{{ ami_id }}"
+        key_name: "{{ key_name }}"
+        group: "{{ security_group }}"
+        wait: yes
+        count: 1
+      register: ec2
+
+    - name: Add new instance to host group
+      add_host:
+        hostname: "{{ item.public_ip }}"
+        groups: ec2_hosts
+      loop: "{{ ec2.instances }}"
+
+
+
+
+
+---
+- name: Provision AWS EC2 Instance
+  hosts: localhost
+  gather_facts: no
+  vars:
+    aws_region: us-west-2
+    instance_type: t2.micro
+    ami_id: ami-0abcdef1234567890
+    key_name: mykeypair
+    security_group: mysecuritygroup
+  tasks:
+    - name: Launch EC2 Instance
+      ec2_instance:
+        region: "{{ aws_region }}"
+        instance_type: "{{ instance_type }}"
+        image_id: "{{ ami_id }}"
+        key_name: "{{ key_name }}"
+        group_id: "{{ security_group }}"
+        wait: yes
+        count: 1
+      register: ec2
+
+    - name: Add new instance to host group
+      add_host:
+        hostname: "{{ item.public_ip }}"
+        groups: ec2_hosts
+      loop: "{{ ec2.instances }}"

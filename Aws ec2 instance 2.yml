@@ -1,0 +1,62 @@
+---
+- name: Provision AWS EC2 Instance
+  hosts: localhost
+  gather_facts: no
+  vars_files:
+    - ec2_vars.yml
+  tasks:
+    - name: Create security group
+      ec2_group:
+        name: "{{ security_group }}"
+        description: Security group for EC2 instance
+        vpc_id: "{{ vpc_id }}"
+        region: "{{ aws_region }}"
+        rules:
+          - proto: tcp
+            from_port: 22
+            to_port: 22
+            cidr_ip: 0.0.0.0/0
+          - proto: tcp
+            from_port: 80
+            to_port: 80
+            cidr_ip: 0.0.0.0/0
+          - proto: tcp
+            from_port: 443
+            to_port: 443
+            cidr_ip: 0.0.0.0/0
+          - proto: tcp
+            from_port: 8080
+            to_port: 8080
+            cidr_ip: 0.0.0.0/0
+          - proto: tcp
+            from_port: 9000
+            to_port: 9000
+            cidr_ip: 0.0.0.0/0
+          - proto: tcp
+            from_port: 5000
+            to_port: 5000
+            cidr_ip: 0.0.0.0/0
+          - proto: tcp
+            from_port: 5173
+            to_port: 5173
+            cidr_ip: 0.0.0.0/0
+      register: sg
+
+    - name: Launch EC2 Instance
+      ec2_instance:
+        region: "{{ aws_region }}"
+        instance_type: "{{ instance_type }}"
+        image_id: "{{ ami_id }}"
+        key_name: "{{ key_name }}"
+        vpc_subnet_id: "{{ vpc_id }}"
+        group_id: "{{ sg.group_id }}"
+        wait: yes
+        count: 1
+        user_data: "{{ lookup('file', 'bootstrap2.sh') }}"
+      register: ec2
+
+    - name: Add new instance to host group
+      add_host:
+        hostname: "{{ item.public_ip }}"
+        groups: ec2_hosts
+      loop: "{{ ec2.instances }}"
