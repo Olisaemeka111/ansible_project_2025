@@ -1,6 +1,6 @@
 aws_region: us-west-2
 instance_type: t2.micro
 ami_id: ami-0abcdef1234567890
-key_name: mykeypair
+key_name: docker compose
 security_group: mysecuritygroup
-vpc_id: vpc-0abcdef1234567890
+vpc_id: vpc-08dfa8b211d04b403
