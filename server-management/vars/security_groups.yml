@@ -1,0 +1,155 @@
+---
+# Security Groups for 3-Tier Architecture
+# Web Tier -> App Tier -> Database Tier with minimal privilege
+
+vpc_id: "vpc-0d04fc9c2718e2b80"
+region: "us-east-2"
+
+# Reference to existing Bastion security group for SSH access
+bastion_sg_name: "Bastion-host-sg"
+
+# Security Group Definitions
+security_groups:
+  - name: vprofile-web-tier-sg
+    description: "Web Tier - Internet-facing servers (ALB/public)"
+    tags:
+      Name: vprofile-web-tier-sg
+      Project: Vprofile
+      Tier: web
+    rules_ingress:
+      - proto: tcp
+        from_port: 80
+        to_port: 80
+        cidr_ip: 0.0.0.0/0
+        rule_desc: "HTTP from internet"
+      - proto: tcp
+        from_port: 443
+        to_port: 443
+        cidr_ip: 0.0.0.0/0
+        rule_desc: "HTTPS from internet"
+      - proto: tcp
+        from_port: 22
+        to_port: 22
+        group_name: "{{ bastion_sg_name }}"
+        rule_desc: "SSH from Bastion host"
+    rules_egress:
+      # Allow to App Tier on application ports
+      - proto: tcp
+        from_port: 8000
+        to_port: 9000
+        group_name: vprofile-app-tier-sg
+        rule_desc: "App tier ports (8000-9000)"
+      # Allow DNS for package updates, external APIs
+      - proto: udp
+        from_port: 53
+        to_port: 53
+        cidr_ip: 0.0.0.0/0
+        rule_desc: "DNS queries"
+      # Allow HTTPS for external package repos, API calls
+      - proto: tcp
+        from_port: 443
+        to_port: 443
+        cidr_ip: 0.0.0.0/0
+        rule_desc: "HTTPS to internet (repos, APIs)"
+
+  - name: vprofile-app-tier-sg
+    description: "App Tier - Application servers (private subnets)"
+    tags:
+      Name: vprofile-app-tier-sg
+      Project: Vprofile
+      Tier: app
+    rules_ingress:
+      # Only from Web Tier on app ports
+      - proto: tcp
+        from_port: 8000
+        to_port: 9000
+        group_name: vprofile-web-tier-sg
+        rule_desc: "App ports from Web Tier (8000-9000)"
+      # SSH from Bastion for management
+      - proto: tcp
+        from_port: 22
+        to_port: 22
+        group_name: "{{ bastion_sg_name }}"
+        rule_desc: "SSH from Bastion host"
+    rules_egress:
+      # MySQL/MariaDB port
+      - proto: tcp
+        from_port: 3306
+        to_port: 3306
+        group_name: vprofile-db-tier-sg
+        rule_desc: "MySQL/MariaDB (3306) to DB Tier"
+      # PostgreSQL port
+      - proto: tcp
+        from_port: 5432
+        to_port: 5432
+        group_name: vprofile-db-tier-sg
+        rule_desc: "PostgreSQL (5432) to DB Tier"
+      # MongoDB port
+      - proto: tcp
+        from_port: 27017
+        to_port: 27017
+        group_name: vprofile-db-tier-sg
+        rule_desc: "MongoDB (27017) to DB Tier"
+      # Redis/Memcached port
+      - proto: tcp
+        from_port: 6379
+        to_port: 6379
+        group_name: vprofile-db-tier-sg
+        rule_desc: "Redis (6379) to DB Tier"
+      # DNS for package updates and external services
+      - proto: udp
+        from_port: 53
+        to_port: 53
+        cidr_ip: 0.0.0.0/0
+        rule_desc: "DNS queries"
+      # HTTPS for CloudWatch, package repos, external APIs
+      - proto: tcp
+        from_port: 443
+        to_port: 443
+        cidr_ip: 0.0.0.0/0
+        rule_desc: "HTTPS (monitoring, repos, APIs)"
+
+  - name: vprofile-db-tier-sg
+    description: "Database Tier - Restricted database servers (private subnets, no outbound)"
+    tags:
+      Name: vprofile-db-tier-sg
+      Project: Vprofile
+      Tier: db
+    rules_ingress:
+      # MySQL/MariaDB - only from App Tier
+      - proto: tcp
+        from_port: 3306
+        to_port: 3306
+        group_name: vprofile-app-tier-sg
+        rule_desc: "MySQL/MariaDB (3306) from App Tier"
+      # PostgreSQL - only from App Tier
+      - proto: tcp
+        from_port: 5432
+        to_port: 5432
+        group_name: vprofile-app-tier-sg
+        rule_desc: "PostgreSQL (5432) from App Tier"
+      # MongoDB - only from App Tier
+      - proto: tcp
+        from_port: 27017
+        to_port: 27017
+        group_name: vprofile-app-tier-sg
+        rule_desc: "MongoDB (27017) from App Tier"
+      # Redis/Memcached - only from App Tier
+      - proto: tcp
+        from_port: 6379
+        to_port: 6379
+        group_name: vprofile-app-tier-sg
+        rule_desc: "Redis (6379) from App Tier"
+      # SSH from Bastion for emergency management
+      - proto: tcp
+        from_port: 22
+        to_port: 22
+        group_name: "{{ bastion_sg_name }}"
+        rule_desc: "SSH from Bastion host (emergency only)"
+    # Database tier has DENY ALL egress (no outbound traffic allowed)
+    # This is the strictest configuration - DB servers cannot initiate connections
+    rules_egress:
+      # NOTE: By default, AWS allows all egress. To implement true "DENY ALL",
+      # we would need to remove the default rule. For now, we explicitly deny
+      # all by not specifying any egress rules and manually removing defaults.
+      # This requires special handling in the playbook.

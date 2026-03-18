@@ -1,0 +1,31 @@
+---
+# Web Tier Group Variables
+# Frontend/reverse proxy servers in public subnets
+
+tier_name: web
+tier_description: "Web Tier - Internet-facing web servers (Nginx/Apache)"
+
+# App port ranges (where this tier sends traffic)
+outbound_app_ports:
+  - start: 8000
+    end: 9000
+    protocol: tcp
+    description: "Application tier port range"
+
+# Service ports that may run on web tier
+web_service_ports:
+  - port: 80
+    protocol: tcp
+    description: "HTTP"
+  - port: 443
+    protocol: tcp
+    description: "HTTPS"
+  - port: 8000
+    protocol: tcp
+    description: "Alternative web service"
+
+# Security group name
+security_group: vprofile-web-tier-sg
+
+# Packages to install on this tier
+packages_to_install: "{{ packages_for_web_tier }}"

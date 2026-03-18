@@ -1,0 +1,4 @@
+---
+# Batch 1 specific variables (servers 01-10)
+batch_number: 1
+batch_name: batch_1

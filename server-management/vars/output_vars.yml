@@ -1,0 +1,31 @@
+---
+# VPC and Network Output Variables
+# Created via SSM on control node: 2026-03-17
+# VPC CIDR: 172.20.0.0/16
+
+# VPC Configuration
+vpc_id: "vpc-0d04fc9c2718e2b80"
+region: "us-east-2"
+
+# Public Subnets (172.20.1-3.0/24)
+pubsub1id: "subnet-060bf32552f2ac374"  # us-east-2a - 172.20.1.0/24
+pubsub2id: "subnet-005f68530a91dd4cf"  # us-east-2b - 172.20.2.0/24
+pubsub3id: "subnet-0c28a4f6b504c0df1"  # us-east-2c - 172.20.3.0/24
+
+# Private Subnets (172.20.4-6.0/24)
+privsub1id: "subnet-0b2cc9f9b9fcd424f"  # us-east-2a - 172.20.4.0/24
+privsub2id: "subnet-03d0d469c1224cc95"  # us-east-2b - 172.20.5.0/24
+privsub3id: "subnet-02b7827f9d1f4494f"  # us-east-2c - 172.20.6.0/24
+
+# Internet Gateway
+igwid: "igw-063d25839e6809e1e"
+
+# NAT Gateway
+NATGWid: "nat-05d4476864aaeed7e"
+
+# Route Tables
+pubRTid: "rtb-049f13971340ce4d6"
+privRTid: "rtb-01438e746de99ba4c"
+
+# NOTE: If VPC was recreated or IDs changed, update these values from:
+# - aws ec2 describe-vpcs --filter "Name=tag:Name,Values=Vprofile-vpc" --region us-east-2

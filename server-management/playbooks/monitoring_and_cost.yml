@@ -1,0 +1,174 @@
+---
+- name: Collect Resource Metrics from App Servers
+  hosts: app_servers
+  serial: 10
+  become: false
+
+  tasks:
+    - name: Get system metrics
+      block:
+        - name: Get CPU information
+          ansible.builtin.shell: |
+            nproc=$(nproc)
+            load=$(cat /proc/loadavg | awk '{print $1}')
+            echo "{\"cpu_cores\": $nproc, \"load_average\": $load}"
+          register: cpu_metrics
+          changed_when: false
+
+        - name: Get memory information
+          ansible.builtin.shell: |
+            free -b | awk '/^Mem/ {print "{\"total\": " $2 ", \"used\": " $3 ", \"free\": " $4 "}"}'
+          register: memory_metrics
+          changed_when: false
+
+        - name: Get disk information
+          ansible.builtin.shell: |
+            df -B1 / | awk 'NR==2 {print "{\"total\": " $2 ", \"used\": " $3 ", \"available\": " $4 "}"}'
+          register: disk_metrics
+          changed_when: false
+
+        - name: Get network information
+          ansible.builtin.shell: |
+            cat /proc/net/dev | grep eth0 | awk '{print "{\"bytes_in\": " $2 ", \"bytes_out\": " $10 "}"}'
+          register: network_metrics
+          changed_when: false
+
+    - name: Collect all metrics
+      set_fact:
+        instance_metrics:
+          hostname: "{{ inventory_hostname }}"
+          private_ip: "{{ ansible_host }}"
+          batch: "{{ batch }}"
+          timestamp: "{{ ansible_date_time.iso8601 }}"
+          cpu: "{{ cpu_metrics.stdout | from_json }}"
+          memory: "{{ memory_metrics.stdout | from_json }}"
+          disk: "{{ disk_metrics.stdout | from_json }}"
+          network: "{{ network_metrics.stdout | from_json }}"
+
+    - name: Save instance metrics locally
+      copy:
+        content: "{{ instance_metrics | to_nice_json }}"
+        dest: "/tmp/metrics_{{ inventory_hostname }}.json"
+      delegate_to: localhost
+      become: false
+
+- name: Generate Cost and Resource Report
+  hosts: localhost
+  connection: local
+  gather_facts: true
+
+  vars:
+    region: us-east-2
+    report_dir: ../reports
+
+  tasks:
+    - name: Create reports directory
+      file:
+        path: "{{ report_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: Get current month cost using AWS CLI
+      block:
+        - name: Calculate date range for current month
+          set_fact:
+            month_start: "{{ ansible_date_time.iso8601 | regex_replace('-\\d{2}T.*', '-01') }}"
+            month_end: "{{ ansible_date_time.iso8601 | regex_search('^\\d{4}-\\d{2}') }}-{{ '%d' | strftime(now().timestamp() | int + 86400 * (now().day - 1)) }}"
+
+        - name: Get AWS cost and usage
+          ansible.builtin.shell: |
+            aws ce get-cost-and-usage \
+              --time-period Start=$(date +%Y-%m-01) End=$(date +%Y-%m-%d) \
+              --granularity MONTHLY \
+              --metrics "UnblendedCost" \
+              --group-by Type=DIMENSION,Key=SERVICE \
+              --region {{ region }} \
+              --output json 2>/dev/null || echo '{"ResultsByTime": [{"Total": {"UnblendedCost": {"Amount": "0", "Unit": "USD"}}, "Groups": []}]}'
+          register: cost_data
+          changed_when: false
+          failed_when: false
+
+        - name: Parse cost data
+          set_fact:
+            cost_json: "{{ cost_data.stdout | from_json }}"
+          when: cost_data.stdout | length > 0
+
+    - name: Collect all metrics files
+      find:
+        paths: /tmp
+        patterns: "metrics_*.json"
+        file_type: file
+      register: metrics_files
+
+    - name: Load all instance metrics
+      set_fact:
+        all_metrics: []
+
+    - name: Aggregate metrics
+      set_fact:
+        all_metrics: "{{ all_metrics + [item.stdout | from_json] }}"
+      loop: "{{ metrics_files.files }}"
+      vars:
+        item:
+          stdout: "{{ lookup('file', item.path) }}"
+      when: metrics_files.matched > 0
+
+    - name: Generate HTML report
+      template:
+        src: ../templates/monitoring_report.html.j2
+        dest: "{{ report_dir }}/cost_report_{{ ansible_date_time.date }}.html"
+      vars:
+        total_cost: "{{ cost_json.ResultsByTime[0].Total.UnblendedCost.Amount | default('0') if cost_json is defined else '0' }}"
+        service_costs: "{{ cost_json.ResultsByTime[0].Groups if cost_json is defined else [] }}"
+        instance_count: "{{ all_metrics | length }}"
+      when: cost_json is defined
+
+    - name: Display cost summary
+      debug:
+        msg: |
+          +==================================================+
+          |         AWS Cost & Resource Report               |
+          +==================================================+
+
+          [STATS] Summary
+          --------------------------------------------------
+          Report Date: {{ ansible_date_time.date }}
+          Region: {{ region }}
+          Instances Monitored: {{ all_metrics | length }}
+
+          [COST] Cost Information
+          --------------------------------------------------
+          {% if cost_json is defined %}
+          Current Month Cost: ${{ cost_json.ResultsByTime[0].Total.UnblendedCost.Amount }}
+          {% for group in cost_json.ResultsByTime[0].Groups %}
+          - {{ group.Keys[0] }}: ${{ group.Metrics.UnblendedCost.Amount }}
+          {% endfor %}
+          {% else %}
+          Unable to retrieve cost data. Ensure AWS CLI is configured.
+          {% endif %}
+
+          Instance Metrics
+          --------------------------------------------------
+          {% for metric in all_metrics %}
+          {{ metric.hostname }}:
+            IP: {{ metric.private_ip }} (Batch: {{ metric.batch }})
+            Memory: {{ (metric.memory.used / 1024 / 1024 / 1024) | round(2) }}GB / {{ (metric.memory.total / 1024 / 1024 / 1024) | round(2) }}GB
+            Disk: {{ (metric.disk.used / 1024 / 1024 / 1024) | round(2) }}GB / {{ (metric.disk.total / 1024 / 1024 / 1024) | round(2) }}GB
+            CPU Load: {{ metric.cpu.load_average }}
+            Network: IN {{ (metric.network.bytes_in / 1024 / 1024) | round(2) }}MB / OUT {{ (metric.network.bytes_out / 1024 / 1024) | round(2) }}MB
+
+          {% endfor %}
+
+          Report saved to: {{ report_dir }}/cost_report_{{ ansible_date_time.date }}.html
+
+    - name: Save metrics JSON
+      copy:
+        content: "{{ all_metrics | to_nice_json }}"
+        dest: "{{ report_dir }}/metrics_{{ ansible_date_time.iso8601_basic_short }}.json"
+
+    - name: Cleanup temporary metrics files
+      file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ metrics_files.files }}"
+      when: metrics_files.matched > 0

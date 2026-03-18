@@ -1,0 +1,39 @@
+---
+# Dynamic inventory for 3-Tier Architecture
+# Groups servers by tier (web, app, db) based on AWS tags
+plugin: amazon.aws.aws_ec2
+regions:
+  - us-east-2
+
+# Filters to discover only Vprofile servers with a role tag
+filters:
+  tag:Project: Vprofile
+  tag:Tier:
+    - web
+    - app
+    - db
+  instance-state-name: running
+
+# Group instances by Tier tag (creates web_tier, app_tier, db_tier groups)
+keyed_groups:
+  - key: tags.Tier ~ "_tier"
+    parent_group: all_servers
+    separator: ""
+  # Also create app_servers group for patching/monitoring playbooks
+  - key: tags.Tier ~ "_servers"
+    parent_group: all_servers
+    separator: ""
+
+# Use private IP addresses as hostnames
+hostnames:
+  - private-ip-address
+
+# Add custom attributes to each host
+compose:
+  ansible_host: private_ip_address
+  instance_id: instance_id
+  availability_zone: placement.availability_zone
+  instance_type: instance_type
+  tier: tags.Tier
+  role: tags.Role
+  subnet_id: subnet_id

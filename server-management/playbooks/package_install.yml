@@ -1,0 +1,255 @@
+---
+- name: Install Packages on Web Tier
+  hosts: web_tier
+  serial: 10
+  become: true
+
+  vars_files:
+    - ../vars/packages.yml
+
+  tasks:
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install common packages
+      ansible.builtin.apt:
+        name: "{{ packages_common }}"
+        state: present
+
+    - name: Install web tier packages (Nginx, etc.)
+      ansible.builtin.apt:
+        name: "{{ packages_web }}"
+        state: present
+
+    - name: Create package installation report
+      copy:
+        content: |
+          Package Installation Report - Web Tier
+          =======================================
+          Hostname: {{ inventory_hostname }}
+          IP: {{ ansible_host }}
+          Timestamp: {{ ansible_date_time.iso8601 }}
+          Tier: web
+
+          Common Packages: {{ packages_common | join(', ') }}
+          Web Packages: {{ packages_web | join(', ') }}
+        dest: "/tmp/package_install_{{ inventory_hostname }}.txt"
+
+    - name: Display installation status
+      debug:
+        msg: "[OK] Packages installed on {{ inventory_hostname }}"
+
+- name: Install Packages on App Tier
+  hosts: app_tier
+  serial: 10
+  become: true
+
+  vars_files:
+    - ../vars/packages.yml
+
+  tasks:
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install common packages
+      ansible.builtin.apt:
+        name: "{{ packages_common }}"
+        state: present
+
+    - name: Install Java 17
+      ansible.builtin.apt:
+        name: "{{ java_packages }}"
+        state: present
+
+    - name: Verify Java installation
+      ansible.builtin.command: java -version
+      register: java_version
+      changed_when: false
+
+    - name: Install Python 3 and development tools
+      ansible.builtin.apt:
+        name: "{{ packages_app_common + python_packages }}"
+        state: present
+
+    - name: Verify Python installation
+      ansible.builtin.command: python3 --version
+      register: python_version
+      changed_when: false
+
+    - name: Install Python pip packages
+      ansible.builtin.pip:
+        name: "{{ pip_packages }}"
+        executable: pip3
+        state: present
+
+    - name: Setup Node.js repository (NodeSource)
+      block:
+        - name: Download NodeSource setup script
+          ansible.builtin.shell: curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+          args:
+            warn: false
+          register: nodejs_setup
+          changed_when: "'added' in nodejs_setup.stdout.lower()"
+
+        - name: Install Node.js
+          ansible.builtin.apt:
+            name: nodejs
+            state: present
+            update_cache: yes
+
+    - name: Verify Node.js installation
+      ansible.builtin.command: node --version
+      register: node_version
+      changed_when: false
+
+    - name: Install Docker CE and plugins
+      block:
+        - name: Add Docker GPG key
+          ansible.builtin.apt_key:
+            url: https://download.docker.com/linux/ubuntu/gpg
+            state: present
+
+        - name: Add Docker repository
+          ansible.builtin.apt_repository:
+            repo: "deb https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+            state: present
+            update_cache: yes
+
+        - name: Install Docker packages
+          ansible.builtin.apt:
+            name: "{{ docker_packages }}"
+            state: present
+            update_cache: yes
+
+        - name: Start Docker service
+          ansible.builtin.systemd:
+            name: docker
+            state: started
+            enabled: yes
+
+        - name: Add ubuntu user to docker group
+          ansible.builtin.user:
+            name: ubuntu
+            groups: docker
+            append: yes
+
+    - name: Verify Docker installation
+      ansible.builtin.command: docker --version
+      register: docker_version
+      changed_when: false
+
+    - name: Create package installation report
+      copy:
+        content: |
+          Package Installation Report - App Tier
+          =======================================
+          Hostname: {{ inventory_hostname }}
+          IP: {{ ansible_host }}
+          Timestamp: {{ ansible_date_time.iso8601 }}
+          Tier: app
+
+          Java Version:
+          {{ java_version.stderr }}
+
+          Python Version:
+          {{ python_version.stdout }}
+
+          Node.js Version:
+          {{ node_version.stdout }}
+
+          Docker Version:
+          {{ docker_version.stdout }}
+
+          Pip Packages Installed: {{ pip_packages | join(', ') }}
+        dest: "/tmp/package_install_{{ inventory_hostname }}.txt"
+
+    - name: Display installation status
+      debug:
+        msg: "[OK] All packages installed on {{ inventory_hostname }}"
+
+- name: Install Packages on Database Tier
+  hosts: db_tier
+  serial: 10
+  become: true
+
+  vars_files:
+    - ../vars/packages.yml
+
+  tasks:
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install common packages
+      ansible.builtin.apt:
+        name: "{{ packages_common }}"
+        state: present
+
+    - name: Install database client tools
+      ansible.builtin.apt:
+        name: "{{ packages_db }}"
+        state: present
+
+    - name: Install monitoring packages
+      ansible.builtin.apt:
+        name: "{{ packages_db_monitoring }}"
+        state: present
+
+    - name: Verify MySQL client
+      ansible.builtin.command: mysql --version
+      register: mysql_version
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Verify PostgreSQL client
+      ansible.builtin.command: psql --version
+      register: psql_version
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Verify MongoDB tools
+      ansible.builtin.command: mongosh --version
+      register: mongo_version
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Verify Redis tools
+      ansible.builtin.command: redis-cli --version
+      register: redis_version
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Create package installation report
+      copy:
+        content: |
+          Package Installation Report - Database Tier
+          =============================================
+          Hostname: {{ inventory_hostname }}
+          IP: {{ ansible_host }}
+          Timestamp: {{ ansible_date_time.iso8601 }}
+          Tier: db
+
+          MySQL Client:
+          {{ mysql_version.stdout | default('Not installed') }}
+
+          PostgreSQL Client:
+          {{ psql_version.stdout | default('Not installed') }}
+
+          MongoDB Shell:
+          {{ mongo_version.stdout | default('Not installed') }}
+
+          Redis CLI:
+          {{ redis_version.stdout | default('Not installed') }}
+
+          Database Tools Installed: {{ packages_db | join(', ') }}
+          Monitoring Packages: {{ packages_db_monitoring | join(', ') }}
+        dest: "/tmp/package_install_{{ inventory_hostname }}.txt"
+
+    - name: Display installation status
+      debug:
+        msg: "[OK] Database tools installed on {{ inventory_hostname }}"

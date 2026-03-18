@@ -1,0 +1,41 @@
+---
+# Database Tier Group Variables
+# Database servers in private subnets (restricted, no outbound)
+
+tier_name: db
+tier_description: "Database Tier - Database servers (MySQL, PostgreSQL, MongoDB, Redis)"
+
+# Database ports that run on db tier
+database_ports:
+  - port: 3306
+    protocol: tcp
+    description: "MySQL/MariaDB"
+  - port: 5432
+    protocol: tcp
+    description: "PostgreSQL"
+  - port: 27017
+    protocol: tcp
+    description: "MongoDB"
+  - port: 6379
+    protocol: tcp
+    description: "Redis"
+
+# Security group name
+security_group: vprofile-db-tier-sg
+
+# Packages to install on this tier
+packages_to_install: "{{ packages_for_db_tier }}"
+
+# Database server environment
+db_tier_env:
+  DB_BACKUP_ENABLED: "true"
+  DB_MONITORING_ENABLED: "true"
+  LOG_RETENTION_DAYS: 30
+
+# Security hardening for database tier
+security_settings:
+  enforce_ssl_connections: true
+  disable_root_login: true
+  remove_anonymous_users: true
+  restrict_localhost_only: false
+  outbound_traffic: deny_all

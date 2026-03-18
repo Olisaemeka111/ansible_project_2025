@@ -1,0 +1,51 @@
+---
+# App Tier Group Variables
+# Application servers in private subnets (Java, Node.js, Python, Docker)
+
+tier_name: app
+tier_description: "App Tier - Application servers (Java, Node.js, Python, Docker)"
+
+# Service ports that run on app tier
+app_service_ports:
+  - port: 8000
+    protocol: tcp
+    description: "Default app port"
+  - port: 8080
+    protocol: tcp
+    description: "Tomcat/alternative port"
+  - port: 3000
+    protocol: tcp
+    description: "Node.js default"
+  - port: 5000
+    protocol: tcp
+    description: "Flask default"
+  - port: 9000
+    protocol: tcp
+    description: "Alternative app port"
+
+# Database connections (where this tier sends traffic)
+outbound_db_ports:
+  - port: 3306
+    protocol: tcp
+    description: "MySQL/MariaDB"
+  - port: 5432
+    protocol: tcp
+    description: "PostgreSQL"
+  - port: 27017
+    protocol: tcp
+    description: "MongoDB"
+  - port: 6379
+    protocol: tcp
+    description: "Redis/Memcached"
+
+# Security group name
+security_group: vprofile-app-tier-sg
+
+# Packages to install on this tier
+packages_to_install: "{{ packages_for_app_tier }}"
+
+# Environment for application servers
+app_tier_env:
+  APP_ENV: production
+  LOG_LEVEL: info
+  DB_POOL_SIZE: 20

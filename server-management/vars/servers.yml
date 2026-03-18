@@ -1,0 +1,195 @@
+---
+# Server provisioning variables for 3-Tier Architecture
+# Web Tier (10): Public subnets
+# App Tier (10): Private subnets
+# Database Tier (10): Private subnets
+
+server_count: 30
+instance_type: t3.medium
+
+# Ubuntu 22.04 LTS AMI in us-east-2
+ubuntu_22_04_ami: "ami-04a131f50a7b86648"
+
+# VPC Configuration (created 2026-03-17, CIDR: 172.20.0.0/16)
+vpc_id: "vpc-0d04fc9c2718e2b80"
+
+# Public Subnets (Web Tier)
+public_subnets:
+  - subnet_id: "subnet-060bf32552f2ac374"
+    az: "us-east-2a"
+  - subnet_id: "subnet-005f68530a91dd4cf"
+    az: "us-east-2b"
+  - subnet_id: "subnet-0c28a4f6b504c0df1"
+    az: "us-east-2c"
+
+# Private Subnets (App and Database Tiers)
+private_subnets:
+  - subnet_id: "subnet-0b2cc9f9b9fcd424f"
+    az: "us-east-2a"
+  - subnet_id: "subnet-03d0d469c1224cc95"
+    az: "us-east-2b"
+  - subnet_id: "subnet-02b7827f9d1f4494f"
+    az: "us-east-2c"
+
+# Key pair
+key_name: "vprofile-key"
+
+# Common tags for all servers
+tags_common:
+  Project: Vprofile
+  Owner: DevOps Team
+  ManagedBy: Ansible
+
+# ============================================================================
+# WEB TIER SERVERS (10 servers in public subnets)
+# Servers: vprofile-web-01 through vprofile-web-10
+# Subnets: Public (pubsub1, pubsub2, pubsub3)
+# Security Group: vprofile-web-tier-sg
+# Role: Web servers (nginx/apache behind ALB)
+# ============================================================================
+
+web_servers:
+  - name: "vprofile-web-01"
+    subnet_index: 0
+    tier: "web"
+    role: "web-server"
+  - name: "vprofile-web-02"
+    subnet_index: 1
+    tier: "web"
+    role: "web-server"
+  - name: "vprofile-web-03"
+    subnet_index: 2
+    tier: "web"
+    role: "web-server"
+  - name: "vprofile-web-04"
+    subnet_index: 0
+    tier: "web"
+    role: "web-server"
+  - name: "vprofile-web-05"
+    subnet_index: 1
+    tier: "web"
+    role: "web-server"
+  - name: "vprofile-web-06"
+    subnet_index: 2
+    tier: "web"
+    role: "web-server"
+  - name: "vprofile-web-07"
+    subnet_index: 0
+    tier: "web"
+    role: "web-server"
+  - name: "vprofile-web-08"
+    subnet_index: 1
+    tier: "web"
+    role: "web-server"
+  - name: "vprofile-web-09"
+    subnet_index: 2
+    tier: "web"
+    role: "web-server"
+  - name: "vprofile-web-10"
+    subnet_index: 0
+    tier: "web"
+    role: "web-server"
+
+# ============================================================================
+# APP TIER SERVERS (10 servers in private subnets)
+# Servers: vprofile-app-01 through vprofile-app-10
+# Subnets: Private (privsub1, privsub2, privsub3)
+# Security Group: vprofile-app-tier-sg
+# Role: Application servers (Java, Node.js, Python, Docker)
+# ============================================================================
+
+app_servers:
+  - name: "vprofile-app-01"
+    subnet_index: 0
+    tier: "app"
+    role: "app-server"
+  - name: "vprofile-app-02"
+    subnet_index: 1
+    tier: "app"
+    role: "app-server"
+  - name: "vprofile-app-03"
+    subnet_index: 2
+    tier: "app"
+    role: "app-server"
+  - name: "vprofile-app-04"
+    subnet_index: 0
+    tier: "app"
+    role: "app-server"
+  - name: "vprofile-app-05"
+    subnet_index: 1
+    tier: "app"
+    role: "app-server"
+  - name: "vprofile-app-06"
+    subnet_index: 2
+    tier: "app"
+    role: "app-server"
+  - name: "vprofile-app-07"
+    subnet_index: 0
+    tier: "app"
+    role: "app-server"
+  - name: "vprofile-app-08"
+    subnet_index: 1
+    tier: "app"
+    role: "app-server"
+  - name: "vprofile-app-09"
+    subnet_index: 2
+    tier: "app"
+    role: "app-server"
+  - name: "vprofile-app-10"
+    subnet_index: 0
+    tier: "app"
+    role: "app-server"
+
+# ============================================================================
+# DATABASE TIER SERVERS (10 servers in private subnets)
+# Servers: vprofile-db-01 through vprofile-db-10
+# Subnets: Private (privsub1, privsub2, privsub3)
+# Security Group: vprofile-db-tier-sg
+# Role: Database servers (MySQL, PostgreSQL, MongoDB, Redis)
+# Note: No outbound traffic allowed (strictest security posture)
+# ============================================================================
+
+db_servers:
+  - name: "vprofile-db-01"
+    subnet_index: 0
+    tier: "db"
+    role: "db-server"
+  - name: "vprofile-db-02"
+    subnet_index: 1
+    tier: "db"
+    role: "db-server"
+  - name: "vprofile-db-03"
+    subnet_index: 2
+    tier: "db"
+    role: "db-server"
+  - name: "vprofile-db-04"
+    subnet_index: 0
+    tier: "db"
+    role: "db-server"
+  - name: "vprofile-db-05"
+    subnet_index: 1
+    tier: "db"
+    role: "db-server"
+  - name: "vprofile-db-06"
+    subnet_index: 2
+    tier: "db"
+    role: "db-server"
+  - name: "vprofile-db-07"
+    subnet_index: 0
+    tier: "db"
+    role: "db-server"
+  - name: "vprofile-db-08"
+    subnet_index: 1
+    tier: "db"
+    role: "db-server"
+  - name: "vprofile-db-09"
+    subnet_index: 2
+    tier: "db"
+    role: "db-server"
+  - name: "vprofile-db-10"
+    subnet_index: 0
+    tier: "db"
+    role: "db-server"
+
+# Combined list for looping (optional, for convenience)
+all_server_definitions: "{{ web_servers + app_servers + db_servers }}"

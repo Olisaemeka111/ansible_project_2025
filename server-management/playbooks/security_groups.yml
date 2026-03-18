@@ -1,0 +1,402 @@
+---
+- name: Create Security Groups for 3-Tier Architecture
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - ../vars/servers.yml
+    - ../vars/security_groups.yml
+    - ../vars/output_vars.yml
+
+  tasks:
+    - name: Get Bastion security group ID
+      amazon.aws.ec2_group_info:
+        filters:
+          group-name: "{{ bastion_sg_name }}"
+          vpc-id: "{{ vpc_id }}"
+        region: "{{ region }}"
+      register: bastion_sg_result
+      ignore_errors: true
+
+    - name: Store Bastion SG ID
+      set_fact:
+        bastion_sg_id: "{{ bastion_sg_result.security_groups[0].group_id }}"
+      when: bastion_sg_result.security_groups is defined and bastion_sg_result.security_groups | length > 0
+
+    - name: Display Bastion SG status
+      debug:
+        msg: "{{ 'Bastion Security Group ID: ' + bastion_sg_id if bastion_sg_id is defined else 'No Bastion SG found - SSH will use VPC CIDR (172.20.0.0/16)' }}"
+
+    # ========================================================================
+    # STEP 1: CREATE ALL THREE SECURITY GROUPS (no rules yet)
+    # Using purge_rules: false so we don't strip default egress
+    # ========================================================================
+    - name: Create Web Tier Security Group (shell)
+      amazon.aws.ec2_group:
+        name: vprofile-web-tier-sg
+        description: "Web Tier - Internet-facing servers (ALB/public)"
+        vpc_id: "{{ vpc_id }}"
+        region: "{{ region }}"
+        tags:
+          Name: vprofile-web-tier-sg
+          Project: Vprofile
+          Tier: web
+        purge_rules: false
+        purge_rules_egress: false
+        state: present
+      register: web_sg_result
+
+    - name: Create App Tier Security Group (shell)
+      amazon.aws.ec2_group:
+        name: vprofile-app-tier-sg
+        description: "App Tier - Application servers (private subnets)"
+        vpc_id: "{{ vpc_id }}"
+        region: "{{ region }}"
+        tags:
+          Name: vprofile-app-tier-sg
+          Project: Vprofile
+          Tier: app
+        purge_rules: false
+        purge_rules_egress: false
+        state: present
+      register: app_sg_result
+
+    - name: Create Database Tier Security Group (shell)
+      amazon.aws.ec2_group:
+        name: vprofile-db-tier-sg
+        description: "Database Tier - Restricted database servers (private subnets, no outbound)"
+        vpc_id: "{{ vpc_id }}"
+        region: "{{ region }}"
+        tags:
+          Name: vprofile-db-tier-sg
+          Project: Vprofile
+          Tier: db
+        purge_rules: false
+        purge_rules_egress: false
+        state: present
+      register: db_sg_result
+
+    - name: Display created SG IDs
+      debug:
+        msg: |
+          Web SG:  {{ web_sg_result.group_id }}
+          App SG:  {{ app_sg_result.group_id }}
+          DB SG:   {{ db_sg_result.group_id }}
+
+    # ========================================================================
+    # STEP 2: APPLY ALL RULES - now all SG IDs exist for cross-references
+    # purge_rules: true (default) ensures rules match exactly what we specify
+    # ========================================================================
+
+    # --- WEB TIER (with Bastion) ---
+    - name: Configure Web Tier SG rules (with Bastion)
+      amazon.aws.ec2_group:
+        name: vprofile-web-tier-sg
+        description: "Web Tier - Internet-facing servers (ALB/public)"
+        vpc_id: "{{ vpc_id }}"
+        region: "{{ region }}"
+        purge_rules: true
+        purge_rules_egress: true
+        rules:
+          - proto: tcp
+            ports: [80]
+            cidr_ip: 0.0.0.0/0
+            rule_desc: "HTTP from internet"
+          - proto: tcp
+            ports: [443]
+            cidr_ip: 0.0.0.0/0
+            rule_desc: "HTTPS from internet"
+          - proto: tcp
+            ports: [22]
+            group_id: "{{ bastion_sg_id }}"
+            rule_desc: "SSH from Bastion host"
+        rules_egress:
+          - proto: tcp
+            from_port: 8000
+            to_port: 9000
+            group_id: "{{ app_sg_result.group_id }}"
+            rule_desc: "App tier ports (8000-9000)"
+          - proto: udp
+            ports: [53]
+            cidr_ip: 0.0.0.0/0
+            rule_desc: "DNS queries"
+          - proto: tcp
+            ports: [443]
+            cidr_ip: 0.0.0.0/0
+            rule_desc: "HTTPS to internet (repos, APIs)"
+          - proto: tcp
+            ports: [80]
+            cidr_ip: 0.0.0.0/0
+            rule_desc: "HTTP to internet"
+        state: present
+      when: bastion_sg_id is defined
+
+    # --- WEB TIER (without Bastion) ---
+    - name: Configure Web Tier SG rules (without Bastion)
+      amazon.aws.ec2_group:
+        name: vprofile-web-tier-sg
+        description: "Web Tier - Internet-facing servers (ALB/public)"
+        vpc_id: "{{ vpc_id }}"
+        region: "{{ region }}"
+        purge_rules: true
+        purge_rules_egress: true
+        rules:
+          - proto: tcp
+            ports: [80]
+            cidr_ip: 0.0.0.0/0
+            rule_desc: "HTTP from internet"
+          - proto: tcp
+            ports: [443]
+            cidr_ip: 0.0.0.0/0
+            rule_desc: "HTTPS from internet"
+          - proto: tcp
+            ports: [22]
+            cidr_ip: 172.20.0.0/16
+            rule_desc: "SSH from VPC CIDR (control node via SSM)"
+        rules_egress:
+          - proto: tcp
+            from_port: 8000
+            to_port: 9000
+            group_id: "{{ app_sg_result.group_id }}"
+            rule_desc: "App tier ports (8000-9000)"
+          - proto: udp
+            ports: [53]
+            cidr_ip: 0.0.0.0/0
+            rule_desc: "DNS queries"
+          - proto: tcp
+            ports: [443]
+            cidr_ip: 0.0.0.0/0
+            rule_desc: "HTTPS to internet (repos, APIs)"
+          - proto: tcp
+            ports: [80]
+            cidr_ip: 0.0.0.0/0
+            rule_desc: "HTTP to internet"
+        state: present
+      when: bastion_sg_id is not defined
+
+    # --- APP TIER (with Bastion) ---
+    - name: Configure App Tier SG rules (with Bastion)
+      amazon.aws.ec2_group:
+        name: vprofile-app-tier-sg
+        description: "App Tier - Application servers (private subnets)"
+        vpc_id: "{{ vpc_id }}"
+        region: "{{ region }}"
+        purge_rules: true
+        purge_rules_egress: true
+        rules:
+          - proto: tcp
+            from_port: 8000
+            to_port: 9000
+            group_id: "{{ web_sg_result.group_id }}"
+            rule_desc: "App ports from Web Tier (8000-9000)"
+          - proto: tcp
+            ports: [22]
+            group_id: "{{ bastion_sg_id }}"
+            rule_desc: "SSH from Bastion host"
+        rules_egress:
+          - proto: tcp
+            ports: [3306]
+            group_id: "{{ db_sg_result.group_id }}"
+            rule_desc: "MySQL to DB Tier"
+          - proto: tcp
+            ports: [5432]
+            group_id: "{{ db_sg_result.group_id }}"
+            rule_desc: "PostgreSQL to DB Tier"
+          - proto: tcp
+            ports: [27017]
+            group_id: "{{ db_sg_result.group_id }}"
+            rule_desc: "MongoDB to DB Tier"
+          - proto: tcp
+            ports: [6379]
+            group_id: "{{ db_sg_result.group_id }}"
+            rule_desc: "Redis to DB Tier"
+          - proto: udp
+            ports: [53]
+            cidr_ip: 0.0.0.0/0
+            rule_desc: "DNS queries"
+          - proto: tcp
+            ports: [443]
+            cidr_ip: 0.0.0.0/0
+            rule_desc: "HTTPS for monitoring and updates"
+        state: present
+      when: bastion_sg_id is defined
+
+    # --- APP TIER (without Bastion) ---
+    - name: Configure App Tier SG rules (without Bastion)
+      amazon.aws.ec2_group:
+        name: vprofile-app-tier-sg
+        description: "App Tier - Application servers (private subnets)"
+        vpc_id: "{{ vpc_id }}"
+        region: "{{ region }}"
+        purge_rules: true
+        purge_rules_egress: true
+        rules:
+          - proto: tcp
+            from_port: 8000
+            to_port: 9000
+            group_id: "{{ web_sg_result.group_id }}"
+            rule_desc: "App ports from Web Tier (8000-9000)"
+          - proto: tcp
+            ports: [22]
+            cidr_ip: 172.20.0.0/16
+            rule_desc: "SSH from VPC CIDR (control node via SSM)"
+        rules_egress:
+          - proto: tcp
+            ports: [3306]
+            group_id: "{{ db_sg_result.group_id }}"
+            rule_desc: "MySQL to DB Tier"
+          - proto: tcp
+            ports: [5432]
+            group_id: "{{ db_sg_result.group_id }}"
+            rule_desc: "PostgreSQL to DB Tier"
+          - proto: tcp
+            ports: [27017]
+            group_id: "{{ db_sg_result.group_id }}"
+            rule_desc: "MongoDB to DB Tier"
+          - proto: tcp
+            ports: [6379]
+            group_id: "{{ db_sg_result.group_id }}"
+            rule_desc: "Redis to DB Tier"
+          - proto: udp
+            ports: [53]
+            cidr_ip: 0.0.0.0/0
+            rule_desc: "DNS queries"
+          - proto: tcp
+            ports: [443]
+            cidr_ip: 0.0.0.0/0
+            rule_desc: "HTTPS for monitoring and updates"
+        state: present
+      when: bastion_sg_id is not defined
+
+    # --- DATABASE TIER (with Bastion) ---
+    - name: Configure Database Tier SG rules (with Bastion)
+      amazon.aws.ec2_group:
+        name: vprofile-db-tier-sg
+        description: "Database Tier - Restricted database servers (private subnets, no outbound)"
+        vpc_id: "{{ vpc_id }}"
+        region: "{{ region }}"
+        purge_rules: true
+        purge_rules_egress: true
+        rules:
+          - proto: tcp
+            ports: [3306]
+            group_id: "{{ app_sg_result.group_id }}"
+            rule_desc: "MySQL/MariaDB (3306) from App Tier"
+          - proto: tcp
+            ports: [5432]
+            group_id: "{{ app_sg_result.group_id }}"
+            rule_desc: "PostgreSQL (5432) from App Tier"
+          - proto: tcp
+            ports: [27017]
+            group_id: "{{ app_sg_result.group_id }}"
+            rule_desc: "MongoDB (27017) from App Tier"
+          - proto: tcp
+            ports: [6379]
+            group_id: "{{ app_sg_result.group_id }}"
+            rule_desc: "Redis (6379) from App Tier"
+          - proto: tcp
+            ports: [22]
+            group_id: "{{ bastion_sg_id }}"
+            rule_desc: "SSH from Bastion host (emergency only)"
+        rules_egress: []
+        state: present
+      when: bastion_sg_id is defined
+
+    # --- DATABASE TIER (without Bastion) ---
+    - name: Configure Database Tier SG rules (without Bastion)
+      amazon.aws.ec2_group:
+        name: vprofile-db-tier-sg
+        description: "Database Tier - Restricted database servers (private subnets, no outbound)"
+        vpc_id: "{{ vpc_id }}"
+        region: "{{ region }}"
+        purge_rules: true
+        purge_rules_egress: true
+        rules:
+          - proto: tcp
+            ports: [3306]
+            group_id: "{{ app_sg_result.group_id }}"
+            rule_desc: "MySQL/MariaDB (3306) from App Tier"
+          - proto: tcp
+            ports: [5432]
+            group_id: "{{ app_sg_result.group_id }}"
+            rule_desc: "PostgreSQL (5432) from App Tier"
+          - proto: tcp
+            ports: [27017]
+            group_id: "{{ app_sg_result.group_id }}"
+            rule_desc: "MongoDB (27017) from App Tier"
+          - proto: tcp
+            ports: [6379]
+            group_id: "{{ app_sg_result.group_id }}"
+            rule_desc: "Redis (6379) from App Tier"
+          - proto: tcp
+            ports: [22]
+            cidr_ip: 172.20.0.0/16
+            rule_desc: "SSH from VPC CIDR (control node via SSM)"
+        rules_egress: []
+        state: present
+      when: bastion_sg_id is not defined
+
+    # ========================================================================
+    # STORE SECURITY GROUP IDs FOR LATER USE
+    # ========================================================================
+    - name: Generate security groups output file
+      copy:
+        content: |
+          ---
+          # Security Group IDs created by security_groups.yml
+          # Timestamp: {{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}
+
+          web_tier_sg_id: "{{ web_sg_result.group_id }}"
+          app_tier_sg_id: "{{ app_sg_result.group_id }}"
+          db_tier_sg_id: "{{ db_sg_result.group_id }}"
+          bastion_sg_id: "{{ bastion_sg_id | default('NOT_FOUND') }}"
+
+          security_groups_summary:
+            web_tier:
+              name: vprofile-web-tier-sg
+              id: "{{ web_sg_result.group_id }}"
+              rules_ingress: "HTTP (80), HTTPS (443), SSH (22)"
+              rules_egress: "To App Tier (8000-9000), DNS (53), HTTPS (443), HTTP (80)"
+            app_tier:
+              name: vprofile-app-tier-sg
+              id: "{{ app_sg_result.group_id }}"
+              rules_ingress: "App ports (8000-9000 from Web), SSH (22)"
+              rules_egress: "To DB Tier (3306, 5432, 27017, 6379), DNS (53), HTTPS (443)"
+            db_tier:
+              name: vprofile-db-tier-sg
+              id: "{{ db_sg_result.group_id }}"
+              rules_ingress: "DB ports (3306, 5432, 27017, 6379 from App), SSH (22)"
+              rules_egress: "DENY ALL (no outbound traffic)"
+        dest: ../vars/security_groups_output.yml
+
+    - name: Display Security Groups Summary
+      debug:
+        msg: |
+          +==========================================================+
+          |         Security Groups Created Successfully             |
+          +==========================================================+
+
+          [WEB] WEB TIER SECURITY GROUP
+          -----------------------------------------------------------
+          Name: vprofile-web-tier-sg
+          ID:   {{ web_sg_result.group_id }}
+          Ingress:  HTTP (80), HTTPS (443), SSH (22)
+          Egress:   To App Tier (8000-9000), DNS, HTTPS, HTTP
+
+          [APP] APP TIER SECURITY GROUP
+          -----------------------------------------------------------
+          Name: vprofile-app-tier-sg
+          ID:   {{ app_sg_result.group_id }}
+          Ingress:  App ports (8000-9000 from Web), SSH (22)
+          Egress:   To DB Tier (3306, 5432, 27017, 6379), DNS, HTTPS
+
+          [DB] DATABASE TIER SECURITY GROUP
+          -----------------------------------------------------------
+          Name: vprofile-db-tier-sg
+          ID:   {{ db_sg_result.group_id }}
+          Ingress:  DB ports (3306, 5432, 27017, 6379 from App), SSH (22)
+          Egress:   DENY ALL (no outbound traffic) [BLOCKED]
+
+          [OK] Security groups output saved to: ../vars/security_groups_output.yml
+          [OK] Next step: Run provision_servers.yml to create instances

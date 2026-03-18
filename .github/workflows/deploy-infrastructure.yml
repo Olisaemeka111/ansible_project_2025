@@ -1,0 +1,1101 @@
+###############################################################################
+# 3-Tier Infrastructure Deployment - Fully Self-Contained
+#
+# Creates EVERYTHING from scratch:
+#   1. VPC + 6 subnets + IGW + NAT GW + route tables
+#   2. SSH key pair
+#   3. Control node (EC2 in VPC) with Ansible bootstrapped via SSM
+#   4. 3 Security Groups (web, app, db)
+#   5. 30 EC2 servers (10 web, 10 app, 10 db)
+#   6. Application Load Balancer for web tier
+#   7. Package installation on all servers
+#   8. Full inventory display
+#
+# Required GitHub Secrets:
+#   AWS_ACCESS_KEY_ID       - IAM user with full EC2/VPC/ELB/SSM/S3 permissions
+#   AWS_SECRET_ACCESS_KEY   - Corresponding secret key
+#
+# No pre-existing infrastructure needed.
+###############################################################################
+
+name: Deploy 3-Tier Infrastructure
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Action to perform"
+        required: true
+        default: "deploy"
+        type: choice
+        options:
+          - deploy
+          - cleanup
+
+env:
+  AWS_REGION: us-east-2
+  VPC_CIDR: "172.20.0.0/16"
+  S3_BUCKET: bus-terminal-deploy-156041437006
+  AMI_ID: ami-04a131f50a7b86648
+  IAM_PROFILE: bus-terminal-ec2-ssm
+  INSTANCE_TYPE: t3.medium
+  PROJECT_TAG: Vprofile
+
+jobs:
+  # ====================================================================
+  # DEPLOY JOB
+  # ====================================================================
+  deploy:
+    name: Deploy Infrastructure
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.action == 'deploy' }}
+    timeout-minutes: 90
+
+    steps:
+      # ----------------------------------------------------------------
+      # CHECKOUT + AWS CREDENTIALS
+      # ----------------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # ----------------------------------------------------------------
+      # STEP 1: CREATE VPC
+      # ----------------------------------------------------------------
+      - name: Create VPC
+        id: vpc
+        run: |
+          echo "========== CREATING VPC =========="
+
+          # Check if VPC already exists
+          EXISTING_VPC=$(aws ec2 describe-vpcs \
+            --filters "Name=tag:Name,Values=Vprofile-vpc" "Name=cidr,Values=${{ env.VPC_CIDR }}" \
+            --query 'Vpcs[0].VpcId' --output text 2>/dev/null || echo "None")
+
+          if [ "$EXISTING_VPC" != "None" ] && [ -n "$EXISTING_VPC" ]; then
+            VPC_ID="$EXISTING_VPC"
+            echo "[OK] Using existing VPC: $VPC_ID"
+          else
+            VPC_ID=$(aws ec2 create-vpc \
+              --cidr-block ${{ env.VPC_CIDR }} \
+              --tag-specifications "ResourceType=vpc,Tags=[{Key=Name,Value=Vprofile-vpc},{Key=Project,Value=${{ env.PROJECT_TAG }}}]" \
+              --query 'Vpc.VpcId' --output text)
+
+            # Enable DNS hostnames
+            aws ec2 modify-vpc-attribute --vpc-id "$VPC_ID" --enable-dns-hostnames '{"Value":true}'
+            aws ec2 modify-vpc-attribute --vpc-id "$VPC_ID" --enable-dns-support '{"Value":true}'
+            echo "[OK] Created VPC: $VPC_ID"
+          fi
+
+          echo "vpc_id=$VPC_ID" >> "$GITHUB_OUTPUT"
+
+      # ----------------------------------------------------------------
+      # STEP 2: CREATE SUBNETS (3 public + 3 private)
+      # ----------------------------------------------------------------
+      - name: Create subnets
+        id: subnets
+        run: |
+          VPC_ID=${{ steps.vpc.outputs.vpc_id }}
+          echo "========== CREATING SUBNETS in $VPC_ID =========="
+
+          declare -A SUBNET_MAP
+          SUBNET_DEFS=(
+            "pubsub1:172.20.1.0/24:us-east-2a:public"
+            "pubsub2:172.20.2.0/24:us-east-2b:public"
+            "pubsub3:172.20.3.0/24:us-east-2c:public"
+            "privsub1:172.20.4.0/24:us-east-2a:private"
+            "privsub2:172.20.5.0/24:us-east-2b:private"
+            "privsub3:172.20.6.0/24:us-east-2c:private"
+          )
+
+          for DEF in "${SUBNET_DEFS[@]}"; do
+            IFS=':' read -r NAME CIDR AZ TYPE <<< "$DEF"
+
+            # Check if exists
+            EXISTING=$(aws ec2 describe-subnets \
+              --filters "Name=vpc-id,Values=$VPC_ID" "Name=cidr-block,Values=$CIDR" \
+              --query 'Subnets[0].SubnetId' --output text 2>/dev/null || echo "None")
+
+            if [ "$EXISTING" != "None" ] && [ -n "$EXISTING" ]; then
+              SUBNET_ID="$EXISTING"
+            else
+              SUBNET_ID=$(aws ec2 create-subnet \
+                --vpc-id "$VPC_ID" \
+                --cidr-block "$CIDR" \
+                --availability-zone "$AZ" \
+                --tag-specifications "ResourceType=subnet,Tags=[{Key=Name,Value=Vprofile-${NAME}},{Key=Project,Value=${{ env.PROJECT_TAG }}},{Key=Type,Value=${TYPE}}]" \
+                --query 'Subnet.SubnetId' --output text)
+
+              # Enable auto-assign public IP for public subnets
+              if [ "$TYPE" = "public" ]; then
+                aws ec2 modify-subnet-attribute --subnet-id "$SUBNET_ID" --map-public-ip-on-launch
+              fi
+            fi
+
+            echo "${NAME}=${SUBNET_ID}" >> "$GITHUB_OUTPUT"
+            echo "[OK] $NAME ($TYPE, $AZ): $SUBNET_ID"
+          done
+
+      # ----------------------------------------------------------------
+      # STEP 3: CREATE INTERNET GATEWAY
+      # ----------------------------------------------------------------
+      - name: Create Internet Gateway
+        id: igw
+        run: |
+          VPC_ID=${{ steps.vpc.outputs.vpc_id }}
+
+          # Check if IGW already attached
+          EXISTING_IGW=$(aws ec2 describe-internet-gateways \
+            --filters "Name=attachment.vpc-id,Values=$VPC_ID" \
+            --query 'InternetGateways[0].InternetGatewayId' --output text 2>/dev/null || echo "None")
+
+          if [ "$EXISTING_IGW" != "None" ] && [ -n "$EXISTING_IGW" ]; then
+            IGW_ID="$EXISTING_IGW"
+            echo "[OK] Using existing IGW: $IGW_ID"
+          else
+            IGW_ID=$(aws ec2 create-internet-gateway \
+              --tag-specifications "ResourceType=internet-gateway,Tags=[{Key=Name,Value=Vprofile-igw},{Key=Project,Value=${{ env.PROJECT_TAG }}}]" \
+              --query 'InternetGateway.InternetGatewayId' --output text)
+            aws ec2 attach-internet-gateway --internet-gateway-id "$IGW_ID" --vpc-id "$VPC_ID"
+            echo "[OK] Created and attached IGW: $IGW_ID"
+          fi
+
+          echo "igw_id=$IGW_ID" >> "$GITHUB_OUTPUT"
+
+      # ----------------------------------------------------------------
+      # STEP 4: CREATE NAT GATEWAY (in public subnet for private tier)
+      # ----------------------------------------------------------------
+      - name: Create NAT Gateway
+        id: natgw
+        run: |
+          VPC_ID=${{ steps.vpc.outputs.vpc_id }}
+          PUBSUB1=${{ steps.subnets.outputs.pubsub1 }}
+
+          # Check if NAT GW already exists
+          EXISTING_NAT=$(aws ec2 describe-nat-gateways \
+            --filter "Name=vpc-id,Values=$VPC_ID" "Name=state,Values=available,pending" \
+            --query 'NatGateways[0].NatGatewayId' --output text 2>/dev/null || echo "None")
+
+          if [ "$EXISTING_NAT" != "None" ] && [ -n "$EXISTING_NAT" ]; then
+            NAT_ID="$EXISTING_NAT"
+            echo "[OK] Using existing NAT GW: $NAT_ID"
+          else
+            # Allocate Elastic IP
+            EIP_ALLOC=$(aws ec2 allocate-address \
+              --domain vpc \
+              --tag-specifications "ResourceType=elastic-ip,Tags=[{Key=Name,Value=Vprofile-nat-eip},{Key=Project,Value=${{ env.PROJECT_TAG }}}]" \
+              --query 'AllocationId' --output text)
+
+            NAT_ID=$(aws ec2 create-nat-gateway \
+              --subnet-id "$PUBSUB1" \
+              --allocation-id "$EIP_ALLOC" \
+              --tag-specifications "ResourceType=natgateway,Tags=[{Key=Name,Value=Vprofile-natgw},{Key=Project,Value=${{ env.PROJECT_TAG }}}]" \
+              --query 'NatGateway.NatGatewayId' --output text)
+
+            echo "Waiting for NAT Gateway to become available..."
+            aws ec2 wait nat-gateway-available --nat-gateway-ids "$NAT_ID"
+            echo "[OK] Created NAT GW: $NAT_ID"
+          fi
+
+          echo "nat_id=$NAT_ID" >> "$GITHUB_OUTPUT"
+
+      # ----------------------------------------------------------------
+      # STEP 5: CREATE ROUTE TABLES
+      # ----------------------------------------------------------------
+      - name: Create route tables
+        id: routes
+        run: |
+          VPC_ID=${{ steps.vpc.outputs.vpc_id }}
+          IGW_ID=${{ steps.igw.outputs.igw_id }}
+          NAT_ID=${{ steps.natgw.outputs.nat_id }}
+
+          # --- PUBLIC ROUTE TABLE ---
+          EXISTING_PUB_RT=$(aws ec2 describe-route-tables \
+            --filters "Name=vpc-id,Values=$VPC_ID" "Name=tag:Name,Values=Vprofile-pub-rt" \
+            --query 'RouteTables[0].RouteTableId' --output text 2>/dev/null || echo "None")
+
+          if [ "$EXISTING_PUB_RT" != "None" ] && [ -n "$EXISTING_PUB_RT" ]; then
+            PUB_RT="$EXISTING_PUB_RT"
+          else
+            PUB_RT=$(aws ec2 create-route-table \
+              --vpc-id "$VPC_ID" \
+              --tag-specifications "ResourceType=route-table,Tags=[{Key=Name,Value=Vprofile-pub-rt},{Key=Project,Value=${{ env.PROJECT_TAG }}}]" \
+              --query 'RouteTable.RouteTableId' --output text)
+            aws ec2 create-route --route-table-id "$PUB_RT" --destination-cidr-block 0.0.0.0/0 --gateway-id "$IGW_ID"
+          fi
+          echo "[OK] Public RT: $PUB_RT"
+
+          # Associate public subnets
+          for SUBNET in ${{ steps.subnets.outputs.pubsub1 }} ${{ steps.subnets.outputs.pubsub2 }} ${{ steps.subnets.outputs.pubsub3 }}; do
+            aws ec2 associate-route-table --route-table-id "$PUB_RT" --subnet-id "$SUBNET" 2>/dev/null || true
+          done
+
+          # --- PRIVATE ROUTE TABLE ---
+          EXISTING_PRIV_RT=$(aws ec2 describe-route-tables \
+            --filters "Name=vpc-id,Values=$VPC_ID" "Name=tag:Name,Values=Vprofile-priv-rt" \
+            --query 'RouteTables[0].RouteTableId' --output text 2>/dev/null || echo "None")
+
+          if [ "$EXISTING_PRIV_RT" != "None" ] && [ -n "$EXISTING_PRIV_RT" ]; then
+            PRIV_RT="$EXISTING_PRIV_RT"
+          else
+            PRIV_RT=$(aws ec2 create-route-table \
+              --vpc-id "$VPC_ID" \
+              --tag-specifications "ResourceType=route-table,Tags=[{Key=Name,Value=Vprofile-priv-rt},{Key=Project,Value=${{ env.PROJECT_TAG }}}]" \
+              --query 'RouteTable.RouteTableId' --output text)
+            aws ec2 create-route --route-table-id "$PRIV_RT" --destination-cidr-block 0.0.0.0/0 --nat-gateway-id "$NAT_ID"
+          fi
+          echo "[OK] Private RT: $PRIV_RT"
+
+          # Associate private subnets
+          for SUBNET in ${{ steps.subnets.outputs.privsub1 }} ${{ steps.subnets.outputs.privsub2 }} ${{ steps.subnets.outputs.privsub3 }}; do
+            aws ec2 associate-route-table --route-table-id "$PRIV_RT" --subnet-id "$SUBNET" 2>/dev/null || true
+          done
+
+          echo "pub_rt=$PUB_RT" >> "$GITHUB_OUTPUT"
+          echo "priv_rt=$PRIV_RT" >> "$GITHUB_OUTPUT"
+
+      # ----------------------------------------------------------------
+      # STEP 6: CREATE SSH KEY PAIR
+      # ----------------------------------------------------------------
+      - name: Create SSH key pair
+        id: keypair
+        run: |
+          # Check if key pair exists
+          EXISTING=$(aws ec2 describe-key-pairs \
+            --key-names vprofile-key \
+            --query 'KeyPairs[0].KeyPairId' --output text 2>/dev/null || echo "None")
+
+          if [ "$EXISTING" != "None" ] && [ -n "$EXISTING" ]; then
+            echo "[OK] Key pair 'vprofile-key' already exists"
+          else
+            aws ec2 create-key-pair \
+              --key-name vprofile-key \
+              --query 'KeyMaterial' --output text > /tmp/vprofile-key.pem
+            chmod 600 /tmp/vprofile-key.pem
+            echo "[OK] Created key pair 'vprofile-key'"
+          fi
+
+          # Store key for later use (either from secret or newly created)
+          if [ -f /tmp/vprofile-key.pem ]; then
+            echo "key_created=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "key_created=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ----------------------------------------------------------------
+      # STEP 7: GENERATE VARS FILES WITH NEW IDS
+      # ----------------------------------------------------------------
+      - name: Generate vars files with new VPC IDs
+        run: |
+          VPC_ID=${{ steps.vpc.outputs.vpc_id }}
+
+          # --- output_vars.yml ---
+          cat > server-management/vars/output_vars.yml << EOF
+          ---
+          # VPC and Network Output Variables
+          # Auto-generated by GitHub Actions on $(date -u +%Y-%m-%dT%H:%M:%SZ)
+          # VPC CIDR: ${{ env.VPC_CIDR }}
+
+          vpc_id: "${VPC_ID}"
+          region: "${{ env.AWS_REGION }}"
+
+          # Public Subnets
+          pubsub1id: "${{ steps.subnets.outputs.pubsub1 }}"
+          pubsub2id: "${{ steps.subnets.outputs.pubsub2 }}"
+          pubsub3id: "${{ steps.subnets.outputs.pubsub3 }}"
+
+          # Private Subnets
+          privsub1id: "${{ steps.subnets.outputs.privsub1 }}"
+          privsub2id: "${{ steps.subnets.outputs.privsub2 }}"
+          privsub3id: "${{ steps.subnets.outputs.privsub3 }}"
+
+          # Gateways
+          igwid: "${{ steps.igw.outputs.igw_id }}"
+          NATGWid: "${{ steps.natgw.outputs.nat_id }}"
+
+          # Route Tables
+          pubRTid: "${{ steps.routes.outputs.pub_rt }}"
+          privRTid: "${{ steps.routes.outputs.priv_rt }}"
+          EOF
+
+          # Remove leading spaces from heredoc
+          sed -i 's/^          //' server-management/vars/output_vars.yml
+
+          # --- security_groups.yml - update vpc_id ---
+          sed -i "s|^vpc_id:.*|vpc_id: \"${VPC_ID}\"|" server-management/vars/security_groups.yml
+
+          # --- servers.yml - update vpc_id and subnet IDs ---
+          sed -i "s|^vpc_id:.*|vpc_id: \"${VPC_ID}\"|" server-management/vars/servers.yml
+
+          # Update public subnets
+          sed -i "0,/subnet_id:.*# us-east-2a/{s|subnet_id:.*|subnet_id: \"${{ steps.subnets.outputs.pubsub1 }}\"|}" server-management/vars/servers.yml
+
+          # Use python for reliable multi-value replacement
+          python3 << 'PYEOF'
+          import re
+
+          with open('server-management/vars/servers.yml', 'r') as f:
+              content = f.read()
+
+          # Replace public_subnets block
+          pub_block = '''public_subnets:
+            - subnet_id: "${{ steps.subnets.outputs.pubsub1 }}"
+              az: "us-east-2a"
+            - subnet_id: "${{ steps.subnets.outputs.pubsub2 }}"
+              az: "us-east-2b"
+            - subnet_id: "${{ steps.subnets.outputs.pubsub3 }}"
+              az: "us-east-2c"'''
+
+          priv_block = '''private_subnets:
+            - subnet_id: "${{ steps.subnets.outputs.privsub1 }}"
+              az: "us-east-2a"
+            - subnet_id: "${{ steps.subnets.outputs.privsub2 }}"
+              az: "us-east-2b"
+            - subnet_id: "${{ steps.subnets.outputs.privsub3 }}"
+              az: "us-east-2c"'''
+
+          content = re.sub(
+              r'public_subnets:\n(?:\s+-\s+subnet_id:.*\n\s+az:.*\n)+',
+              pub_block + '\n\n',
+              content
+          )
+          content = re.sub(
+              r'private_subnets:\n(?:\s+-\s+subnet_id:.*\n\s+az:.*\n)+',
+              priv_block + '\n\n',
+              content
+          )
+
+          with open('server-management/vars/servers.yml', 'w') as f:
+              f.write(content)
+          PYEOF
+
+          # --- security_groups_output.yml - reset to pending ---
+          cat > server-management/vars/security_groups_output.yml << EOF
+          ---
+          web_tier_sg_id: "pending"
+          app_tier_sg_id: "pending"
+          db_tier_sg_id: "pending"
+          EOF
+          sed -i 's/^          //' server-management/vars/security_groups_output.yml
+
+          echo "[OK] All vars files updated with new VPC IDs"
+          echo "VPC: ${VPC_ID}"
+          echo "Public Subnets: ${{ steps.subnets.outputs.pubsub1 }}, ${{ steps.subnets.outputs.pubsub2 }}, ${{ steps.subnets.outputs.pubsub3 }}"
+          echo "Private Subnets: ${{ steps.subnets.outputs.privsub1 }}, ${{ steps.subnets.outputs.privsub2 }}, ${{ steps.subnets.outputs.privsub3 }}"
+
+      # ----------------------------------------------------------------
+      # STEP 8: UPLOAD CODE TO S3
+      # ----------------------------------------------------------------
+      - name: Upload code to S3
+        run: |
+          aws s3 sync server-management/ \
+            s3://${{ env.S3_BUCKET }}/server-management/ \
+            --exclude "*.log" --exclude "logs/*" --exclude "reports/*" --delete
+          echo "[OK] Code uploaded to S3"
+
+      # ----------------------------------------------------------------
+      # STEP 9: CREATE CONTROL NODE SG
+      # ----------------------------------------------------------------
+      - name: Create control node security group
+        id: control_sg
+        run: |
+          VPC_ID=${{ steps.vpc.outputs.vpc_id }}
+
+          EXISTING_SG=$(aws ec2 describe-security-groups \
+            --filters "Name=group-name,Values=ansible-control-node-sg" "Name=vpc-id,Values=$VPC_ID" \
+            --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || echo "None")
+
+          if [ "$EXISTING_SG" != "None" ] && [ -n "$EXISTING_SG" ]; then
+            echo "sg_id=$EXISTING_SG" >> "$GITHUB_OUTPUT"
+            echo "[OK] Using existing control node SG: $EXISTING_SG"
+          else
+            SG_ID=$(aws ec2 create-security-group \
+              --group-name ansible-control-node-sg \
+              --description "Ansible control node - manages all tiers via SSH" \
+              --vpc-id "$VPC_ID" \
+              --tag-specifications "ResourceType=security-group,Tags=[{Key=Name,Value=ansible-control-node-sg},{Key=Project,Value=${{ env.PROJECT_TAG }}},{Key=Role,Value=control-node}]" \
+              --query 'GroupId' --output text)
+
+            # Inbound: SSH from VPC CIDR (other nodes can reach back if needed)
+            aws ec2 authorize-security-group-ingress \
+              --group-id "$SG_ID" --protocol tcp --port 22 --cidr ${{ env.VPC_CIDR }}
+
+            echo "sg_id=$SG_ID" >> "$GITHUB_OUTPUT"
+            echo "[OK] Created control node SG: $SG_ID"
+          fi
+
+      # ----------------------------------------------------------------
+      # STEP 10: LAUNCH CONTROL NODE IN VPC
+      # ----------------------------------------------------------------
+      - name: Launch control node
+        id: control_node
+        run: |
+          VPC_ID=${{ steps.vpc.outputs.vpc_id }}
+          PUBSUB1=${{ steps.subnets.outputs.pubsub1 }}
+          SG_ID=${{ steps.control_sg.outputs.sg_id }}
+
+          EXISTING=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=ansible-control-node" \
+                      "Name=tag:Project,Values=${{ env.PROJECT_TAG }}" \
+                      "Name=vpc-id,Values=$VPC_ID" \
+                      "Name=instance-state-name,Values=running" \
+            --query 'Reservations[0].Instances[0].InstanceId' --output text 2>/dev/null || echo "None")
+
+          if [ "$EXISTING" != "None" ] && [ -n "$EXISTING" ]; then
+            INSTANCE_ID="$EXISTING"
+            echo "[OK] Using existing control node: $INSTANCE_ID"
+          else
+            INSTANCE_ID=$(aws ec2 run-instances \
+              --image-id ${{ env.AMI_ID }} \
+              --instance-type ${{ env.INSTANCE_TYPE }} \
+              --key-name vprofile-key \
+              --subnet-id "$PUBSUB1" \
+              --security-group-ids "$SG_ID" \
+              --iam-instance-profile Name=${{ env.IAM_PROFILE }} \
+              --associate-public-ip-address \
+              --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=ansible-control-node},{Key=Project,Value=${{ env.PROJECT_TAG }}},{Key=Role,Value=control-node}]" \
+              --query 'Instances[0].InstanceId' --output text)
+            echo "[OK] Launched control node: $INSTANCE_ID"
+          fi
+
+          echo "instance_id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
+
+          aws ec2 wait instance-running --instance-ids "$INSTANCE_ID"
+
+          PRIVATE_IP=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" \
+            --query 'Reservations[0].Instances[0].PrivateIpAddress' --output text)
+          echo "private_ip=$PRIVATE_IP" >> "$GITHUB_OUTPUT"
+          echo "[OK] Control node running at $PRIVATE_IP"
+
+      # ----------------------------------------------------------------
+      # STEP 11: WAIT FOR SSM AGENT
+      # ----------------------------------------------------------------
+      - name: Wait for SSM agent
+        run: |
+          INSTANCE_ID=${{ steps.control_node.outputs.instance_id }}
+          echo "Waiting for SSM agent on $INSTANCE_ID..."
+          for i in $(seq 1 30); do
+            STATUS=$(aws ssm describe-instance-information \
+              --filters "Key=InstanceIds,Values=$INSTANCE_ID" \
+              --query 'InstanceInformationList[0].PingStatus' --output text 2>/dev/null || echo "None")
+            if [ "$STATUS" = "Online" ]; then
+              echo "[OK] SSM agent online (attempt $i)"
+              break
+            fi
+            [ "$i" -eq 30 ] && echo "[FAIL] SSM agent timeout" && exit 1
+            echo "  Attempt $i/30 - waiting 10s..."
+            sleep 10
+          done
+
+      # ----------------------------------------------------------------
+      # STEP 12: BOOTSTRAP CONTROL NODE
+      # ----------------------------------------------------------------
+      - name: Bootstrap control node
+        run: |
+          INSTANCE_ID=${{ steps.control_node.outputs.instance_id }}
+
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --timeout-seconds 600 \
+            --parameters commands='[
+              "set -e",
+              "echo === Bootstrap Start ===",
+              "sudo apt-get update -qq",
+              "sudo apt-get install -y -qq python3-pip python3-venv > /dev/null 2>&1",
+              "pip3 install --quiet ansible boto3 botocore",
+              "export PATH=$PATH:$HOME/.local/bin",
+              "ansible-galaxy collection install amazon.aws --force > /dev/null 2>&1",
+              "echo export PATH=\\$PATH:\\$HOME/.local/bin | sudo tee /etc/profile.d/ansible-path.sh > /dev/null",
+              "sudo pip3 install boto3 botocore > /dev/null 2>&1",
+              "echo === Bootstrap Complete ===",
+              "ansible --version | head -1"
+            ]' \
+            --query 'Command.CommandId' --output text)
+
+          echo "Bootstrap command: $COMMAND_ID"
+
+          for i in $(seq 1 40); do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" \
+              --query 'Status' --output text 2>/dev/null || echo "Pending")
+            case "$STATUS" in
+              Success) echo "[OK] Bootstrap complete"; break ;;
+              Failed|TimedOut|Cancelled)
+                echo "[FAIL] Bootstrap $STATUS"
+                aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" \
+                  --query 'StandardErrorContent' --output text
+                exit 1 ;;
+              *) echo "  [$i/40] $STATUS - waiting 15s..."; sleep 15 ;;
+            esac
+          done
+
+      # ----------------------------------------------------------------
+      # STEP 13: DEPLOY SSH KEY TO CONTROL NODE
+      # ----------------------------------------------------------------
+      - name: Deploy SSH key to control node
+        run: |
+          INSTANCE_ID=${{ steps.control_node.outputs.instance_id }}
+
+          # If we created the key this run, use it; otherwise we need it from the existing key
+          if [ -f /tmp/vprofile-key.pem ]; then
+            KEY_CONTENT=$(cat /tmp/vprofile-key.pem)
+          else
+            echo "[WARN] Key pair already existed. Retrieving from SSM parameter store or prior deployment."
+            echo "If this fails, delete the existing 'vprofile-key' key pair and re-run."
+            # Try to get from parameter store (if stored there)
+            KEY_CONTENT=$(aws ssm get-parameter --name "/vprofile/ssh-key" --with-decryption \
+              --query 'Parameter.Value' --output text 2>/dev/null || echo "")
+            if [ -z "$KEY_CONTENT" ]; then
+              echo "[FAIL] Cannot retrieve SSH private key. Delete key pair 'vprofile-key' and re-run."
+              exit 1
+            fi
+          fi
+
+          # Store key in SSM Parameter Store for future runs
+          aws ssm put-parameter \
+            --name "/vprofile/ssh-key" \
+            --type "SecureString" \
+            --value "$KEY_CONTENT" \
+            --overwrite 2>/dev/null || true
+
+          # Deploy to control node
+          # Escape the key for JSON
+          ESCAPED_KEY=$(echo "$KEY_CONTENT" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))")
+
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --timeout-seconds 30 \
+            --parameters commands="[
+              \"mkdir -p /home/ubuntu/.ssh\",
+              \"echo $ESCAPED_KEY | python3 -c \\\"import sys,json; sys.stdout.write(json.loads(sys.stdin.read()))\\\" > /home/ubuntu/.ssh/vprofile-key.pem\",
+              \"chmod 600 /home/ubuntu/.ssh/vprofile-key.pem\",
+              \"chown ubuntu:ubuntu /home/ubuntu/.ssh/vprofile-key.pem\",
+              \"echo [OK] SSH key deployed\"
+            ]" \
+            --query 'Command.CommandId' --output text)
+
+          aws ssm wait command-executed \
+            --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" 2>/dev/null || true
+
+          STATUS=$(aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" \
+            --query 'Status' --output text)
+          echo "SSH key deploy: $STATUS"
+
+      # ----------------------------------------------------------------
+      # STEP 14: SYNC CODE TO CONTROL NODE
+      # ----------------------------------------------------------------
+      - name: Sync code to control node
+        run: |
+          INSTANCE_ID=${{ steps.control_node.outputs.instance_id }}
+
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --timeout-seconds 120 \
+            --parameters commands='[
+              "mkdir -p /home/ubuntu/deploy",
+              "aws s3 sync s3://${{ env.S3_BUCKET }}/server-management/ /home/ubuntu/deploy/server-management/ --delete",
+              "chown -R ubuntu:ubuntu /home/ubuntu/deploy",
+              "chmod +x /home/ubuntu/deploy/server-management/deploy.sh",
+              "echo [OK] Code synced",
+              "cat /home/ubuntu/deploy/server-management/vars/output_vars.yml"
+            ]' \
+            --query 'Command.CommandId' --output text)
+
+          aws ssm wait command-executed \
+            --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" 2>/dev/null || true
+
+          aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" \
+            --query '{Status:Status,Output:StandardOutputContent}' --output json
+
+      # ----------------------------------------------------------------
+      # STEP 15: RUN FULL DEPLOYMENT (verbose)
+      # ----------------------------------------------------------------
+      - name: Run deployment (all phases)
+        run: |
+          INSTANCE_ID=${{ steps.control_node.outputs.instance_id }}
+
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --timeout-seconds 2400 \
+            --parameters commands='[
+              "cd /home/ubuntu/deploy/server-management",
+              "export PATH=$PATH:/home/ubuntu/.local/bin",
+              "export TERM=xterm",
+              "export HOME=/home/ubuntu",
+              "export ANSIBLE_VERBOSITY=2",
+              "./deploy.sh deploy --yes 2>&1"
+            ]' \
+            --query 'Command.CommandId' --output text)
+
+          echo "Deployment command: $COMMAND_ID"
+
+          for i in $(seq 1 80); do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" \
+              --query 'Status' --output text 2>/dev/null || echo "Pending")
+            case "$STATUS" in
+              Success)
+                echo "[OK] Deployment completed"
+                break ;;
+              Failed|TimedOut|Cancelled)
+                echo "[FAIL] Deployment $STATUS"
+                aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" \
+                  --query 'StandardErrorContent' --output text
+                aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" \
+                  --query 'StandardOutputContent' --output text
+                exit 1 ;;
+              *) echo "  [$i/80] $STATUS - waiting 30s..."; sleep 30 ;;
+            esac
+          done
+
+          echo ""
+          echo "========== DEPLOYMENT OUTPUT =========="
+          aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" \
+            --query 'StandardOutputContent' --output text
+
+      # ----------------------------------------------------------------
+      # STEP 16: CREATE APPLICATION LOAD BALANCER FOR WEB TIER
+      # ----------------------------------------------------------------
+      - name: Create Application Load Balancer
+        id: alb
+        run: |
+          VPC_ID=${{ steps.vpc.outputs.vpc_id }}
+          echo "========== CREATING ALB FOR WEB TIER =========="
+
+          # Create ALB security group
+          ALB_SG=$(aws ec2 describe-security-groups \
+            --filters "Name=group-name,Values=vprofile-alb-sg" "Name=vpc-id,Values=$VPC_ID" \
+            --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || echo "None")
+
+          if [ "$ALB_SG" = "None" ] || [ -z "$ALB_SG" ]; then
+            ALB_SG=$(aws ec2 create-security-group \
+              --group-name vprofile-alb-sg \
+              --description "ALB - Internet-facing load balancer" \
+              --vpc-id "$VPC_ID" \
+              --tag-specifications "ResourceType=security-group,Tags=[{Key=Name,Value=vprofile-alb-sg},{Key=Project,Value=${{ env.PROJECT_TAG }}}]" \
+              --query 'GroupId' --output text)
+
+            aws ec2 authorize-security-group-ingress --group-id "$ALB_SG" \
+              --protocol tcp --port 80 --cidr 0.0.0.0/0
+            aws ec2 authorize-security-group-ingress --group-id "$ALB_SG" \
+              --protocol tcp --port 443 --cidr 0.0.0.0/0
+            echo "[OK] Created ALB SG: $ALB_SG"
+          else
+            echo "[OK] Using existing ALB SG: $ALB_SG"
+          fi
+
+          # Create ALB
+          ALB_ARN=$(aws elbv2 describe-load-balancers \
+            --names vprofile-web-alb \
+            --query 'LoadBalancers[0].LoadBalancerArn' --output text 2>/dev/null || echo "None")
+
+          if [ "$ALB_ARN" = "None" ] || [ -z "$ALB_ARN" ]; then
+            ALB_ARN=$(aws elbv2 create-load-balancer \
+              --name vprofile-web-alb \
+              --subnets ${{ steps.subnets.outputs.pubsub1 }} ${{ steps.subnets.outputs.pubsub2 }} ${{ steps.subnets.outputs.pubsub3 }} \
+              --security-groups "$ALB_SG" \
+              --scheme internet-facing \
+              --type application \
+              --ip-address-type ipv4 \
+              --tags Key=Name,Value=vprofile-web-alb Key=Project,Value=${{ env.PROJECT_TAG }} \
+              --query 'LoadBalancers[0].LoadBalancerArn' --output text)
+            echo "[OK] Created ALB"
+          else
+            echo "[OK] Using existing ALB"
+          fi
+
+          ALB_DNS=$(aws elbv2 describe-load-balancers \
+            --load-balancer-arns "$ALB_ARN" \
+            --query 'LoadBalancers[0].DNSName' --output text)
+          echo "ALB DNS: $ALB_DNS"
+
+          # Create target group
+          TG_ARN=$(aws elbv2 describe-target-groups \
+            --names vprofile-web-tg \
+            --query 'TargetGroups[0].TargetGroupArn' --output text 2>/dev/null || echo "None")
+
+          if [ "$TG_ARN" = "None" ] || [ -z "$TG_ARN" ]; then
+            TG_ARN=$(aws elbv2 create-target-group \
+              --name vprofile-web-tg \
+              --protocol HTTP --port 80 \
+              --vpc-id "$VPC_ID" \
+              --target-type instance \
+              --health-check-path "/" \
+              --health-check-interval-seconds 30 \
+              --healthy-threshold-count 2 \
+              --unhealthy-threshold-count 3 \
+              --tags Key=Name,Value=vprofile-web-tg Key=Project,Value=${{ env.PROJECT_TAG }} \
+              --query 'TargetGroups[0].TargetGroupArn' --output text)
+            echo "[OK] Created target group"
+          else
+            echo "[OK] Using existing target group"
+          fi
+
+          # Register web tier instances as targets
+          WEB_INSTANCES=$(aws ec2 describe-instances \
+            --filters "Name=vpc-id,Values=$VPC_ID" \
+                      "Name=tag:Tier,Values=web" \
+                      "Name=tag:Project,Values=${{ env.PROJECT_TAG }}" \
+                      "Name=instance-state-name,Values=running" \
+            --query 'Reservations[].Instances[].InstanceId' --output text)
+
+          if [ -n "$WEB_INSTANCES" ]; then
+            TARGETS=""
+            for ID in $WEB_INSTANCES; do
+              TARGETS="$TARGETS Id=$ID"
+            done
+            aws elbv2 register-targets --target-group-arn "$TG_ARN" --targets $TARGETS
+            echo "[OK] Registered $(echo $WEB_INSTANCES | wc -w) web servers as targets"
+          fi
+
+          # Create listener (HTTP on port 80)
+          EXISTING_LISTENER=$(aws elbv2 describe-listeners \
+            --load-balancer-arn "$ALB_ARN" \
+            --query 'Listeners[?Port==`80`].ListenerArn' --output text 2>/dev/null || echo "")
+
+          if [ -z "$EXISTING_LISTENER" ]; then
+            aws elbv2 create-listener \
+              --load-balancer-arn "$ALB_ARN" \
+              --protocol HTTP --port 80 \
+              --default-actions Type=forward,TargetGroupArn="$TG_ARN"
+            echo "[OK] Created HTTP listener"
+          else
+            echo "[OK] Listener already exists"
+          fi
+
+          echo ""
+          echo "=========================================="
+          echo "  ALB URL: http://${ALB_DNS}"
+          echo "=========================================="
+
+          echo "alb_dns=$ALB_DNS" >> "$GITHUB_OUTPUT"
+          echo "alb_arn=$ALB_ARN" >> "$GITHUB_OUTPUT"
+
+      # ----------------------------------------------------------------
+      # STEP 17: DISPLAY INVENTORY
+      # ----------------------------------------------------------------
+      - name: Display EC2 inventory
+        if: always()
+        run: |
+          VPC_ID=${{ steps.vpc.outputs.vpc_id }}
+          echo ""
+          echo "========== EC2 INSTANCE INVENTORY =========="
+          echo "VPC: $VPC_ID"
+          echo ""
+
+          for tier in web app db; do
+            TIER_UPPER=$(echo "$tier" | tr '[:lower:]' '[:upper:]')
+            echo "[$TIER_UPPER] $TIER_UPPER TIER"
+            echo "--------------------------------------------------------------"
+            printf "  %-25s %-22s %-18s %-15s\n" "NAME" "INSTANCE ID" "PRIVATE IP" "AZ"
+            echo "  ---------------------------------------------------------------"
+
+            aws ec2 describe-instances \
+              --filters \
+                "Name=vpc-id,Values=$VPC_ID" \
+                "Name=tag:Tier,Values=${tier}" \
+                "Name=tag:Project,Values=${{ env.PROJECT_TAG }}" \
+                "Name=instance-state-name,Values=running" \
+              --query 'Reservations[].Instances[].{Name:Tags[?Key==`Name`].Value|[0],ID:InstanceId,IP:PrivateIpAddress,AZ:Placement.AvailabilityZone}' \
+              --output text | sort | while read -r az id ip name; do
+                printf "  %-25s %-22s %-18s %-15s\n" "$name" "$id" "$ip" "$az"
+            done
+            echo ""
+          done
+
+          echo "[WEB] PUBLIC IPs"
+          echo "--------------------------------------------------------------"
+          printf "  %-25s %-18s %-18s\n" "NAME" "PRIVATE IP" "PUBLIC IP"
+          echo "  ---------------------------------------------------------------"
+          aws ec2 describe-instances \
+            --filters "Name=vpc-id,Values=$VPC_ID" "Name=tag:Tier,Values=web" \
+                      "Name=tag:Project,Values=${{ env.PROJECT_TAG }}" \
+                      "Name=instance-state-name,Values=running" \
+            --query 'Reservations[].Instances[].{Name:Tags[?Key==`Name`].Value|[0],PrivIP:PrivateIpAddress,PubIP:PublicIpAddress}' \
+            --output text | sort | while read -r name privip pubip; do
+              printf "  %-25s %-18s %-18s\n" "$name" "$privip" "${pubip:-N/A}"
+          done
+          echo ""
+
+          TOTAL=$(aws ec2 describe-instances \
+            --filters "Name=vpc-id,Values=$VPC_ID" "Name=tag:Project,Values=${{ env.PROJECT_TAG }}" \
+                      "Name=tag:Role,Values=web-server,app-server,db-server" \
+                      "Name=instance-state-name,Values=running" \
+            --query 'Reservations[].Instances[].InstanceId' --output text | wc -w)
+          echo "Total Running Instances: $TOTAL"
+
+          ALB_DNS="${{ steps.alb.outputs.alb_dns }}"
+          if [ -n "$ALB_DNS" ]; then
+            echo ""
+            echo "=========================================="
+            echo "  ALB URL: http://${ALB_DNS}"
+            echo "=========================================="
+          fi
+
+      # ----------------------------------------------------------------
+      # STEP 18: DEPLOYMENT SUMMARY
+      # ----------------------------------------------------------------
+      - name: Deployment summary
+        if: always()
+        run: |
+          echo ""
+          echo "+================================================================+"
+          echo "|           DEPLOYMENT SUMMARY                                   |"
+          echo "+================================================================+"
+          echo ""
+          echo "  VPC:              ${{ steps.vpc.outputs.vpc_id }}"
+          echo "  Control Node:     ${{ steps.control_node.outputs.instance_id }} (${{ steps.control_node.outputs.private_ip }})"
+          echo "  Region:           ${{ env.AWS_REGION }}"
+          echo "  ALB DNS:          ${{ steps.alb.outputs.alb_dns }}"
+          echo ""
+          echo "  Public Subnets:   ${{ steps.subnets.outputs.pubsub1 }}"
+          echo "                    ${{ steps.subnets.outputs.pubsub2 }}"
+          echo "                    ${{ steps.subnets.outputs.pubsub3 }}"
+          echo "  Private Subnets:  ${{ steps.subnets.outputs.privsub1 }}"
+          echo "                    ${{ steps.subnets.outputs.privsub2 }}"
+          echo "                    ${{ steps.subnets.outputs.privsub3 }}"
+          echo ""
+          echo "  IGW:              ${{ steps.igw.outputs.igw_id }}"
+          echo "  NAT GW:           ${{ steps.natgw.outputs.nat_id }}"
+          echo ""
+
+  # ====================================================================
+  # CLEANUP JOB - Destroy EVERYTHING
+  # ====================================================================
+  cleanup:
+    name: Cleanup All Resources
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.action == 'cleanup' }}
+    timeout-minutes: 30
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Find VPC
+        id: find_vpc
+        run: |
+          VPC_ID=$(aws ec2 describe-vpcs \
+            --filters "Name=tag:Name,Values=Vprofile-vpc" \
+            --query 'Vpcs[0].VpcId' --output text 2>/dev/null || echo "None")
+          echo "vpc_id=$VPC_ID" >> "$GITHUB_OUTPUT"
+          echo "VPC: $VPC_ID"
+
+      - name: Delete ALB and target groups
+        run: |
+          echo "=== Deleting ALB ==="
+
+          # Delete listeners first
+          ALB_ARN=$(aws elbv2 describe-load-balancers --names vprofile-web-alb \
+            --query 'LoadBalancers[0].LoadBalancerArn' --output text 2>/dev/null || echo "None")
+          if [ "$ALB_ARN" != "None" ] && [ -n "$ALB_ARN" ]; then
+            LISTENERS=$(aws elbv2 describe-listeners --load-balancer-arn "$ALB_ARN" \
+              --query 'Listeners[].ListenerArn' --output text 2>/dev/null)
+            for L in $LISTENERS; do
+              aws elbv2 delete-listener --listener-arn "$L" 2>/dev/null || true
+            done
+            aws elbv2 delete-load-balancer --load-balancer-arn "$ALB_ARN"
+            echo "[OK] Deleted ALB"
+            echo "Waiting for ALB to be deprovisioned..."
+            sleep 30
+          fi
+
+          # Delete target groups
+          TG_ARN=$(aws elbv2 describe-target-groups --names vprofile-web-tg \
+            --query 'TargetGroups[0].TargetGroupArn' --output text 2>/dev/null || echo "None")
+          if [ "$TG_ARN" != "None" ] && [ -n "$TG_ARN" ]; then
+            aws elbv2 delete-target-group --target-group-arn "$TG_ARN"
+            echo "[OK] Deleted target group"
+          fi
+
+      - name: Terminate all EC2 instances
+        run: |
+          VPC_ID=${{ steps.find_vpc.outputs.vpc_id }}
+          [ "$VPC_ID" = "None" ] && echo "No VPC found" && exit 0
+
+          INSTANCE_IDS=$(aws ec2 describe-instances \
+            --filters "Name=vpc-id,Values=$VPC_ID" "Name=instance-state-name,Values=running,stopped,pending" \
+            --query 'Reservations[].Instances[].InstanceId' --output text)
+
+          if [ -n "$INSTANCE_IDS" ]; then
+            COUNT=$(echo "$INSTANCE_IDS" | wc -w)
+            echo "Terminating $COUNT instances..."
+            aws ec2 terminate-instances --instance-ids $INSTANCE_IDS \
+              --query 'TerminatingInstances[].{ID:InstanceId,State:CurrentState.Name}' --output table
+            aws ec2 wait instance-terminated --instance-ids $INSTANCE_IDS
+            echo "[OK] All instances terminated"
+          else
+            echo "No instances to terminate"
+          fi
+
+      - name: Delete security groups
+        run: |
+          VPC_ID=${{ steps.find_vpc.outputs.vpc_id }}
+          [ "$VPC_ID" = "None" ] && exit 0
+
+          SG_NAMES=("ansible-control-node-sg" "vprofile-alb-sg" "vprofile-web-tier-sg" "vprofile-app-tier-sg" "vprofile-db-tier-sg")
+
+          # Revoke all rules first
+          for sg_name in "${SG_NAMES[@]}"; do
+            SG_ID=$(aws ec2 describe-security-groups \
+              --filters "Name=group-name,Values=$sg_name" "Name=vpc-id,Values=$VPC_ID" \
+              --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || echo "None")
+            if [ "$SG_ID" != "None" ] && [ -n "$SG_ID" ]; then
+              INGRESS=$(aws ec2 describe-security-groups --group-ids "$SG_ID" \
+                --query 'SecurityGroups[0].IpPermissions' --output json)
+              [ "$INGRESS" != "[]" ] && aws ec2 revoke-security-group-ingress \
+                --group-id "$SG_ID" --ip-permissions "$INGRESS" 2>/dev/null || true
+              EGRESS=$(aws ec2 describe-security-groups --group-ids "$SG_ID" \
+                --query 'SecurityGroups[0].IpPermissionsEgress' --output json)
+              [ "$EGRESS" != "[]" ] && aws ec2 revoke-security-group-egress \
+                --group-id "$SG_ID" --ip-permissions "$EGRESS" 2>/dev/null || true
+            fi
+          done
+
+          # Delete SGs
+          for sg_name in "${SG_NAMES[@]}"; do
+            SG_ID=$(aws ec2 describe-security-groups \
+              --filters "Name=group-name,Values=$sg_name" "Name=vpc-id,Values=$VPC_ID" \
+              --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || echo "None")
+            if [ "$SG_ID" != "None" ] && [ -n "$SG_ID" ]; then
+              aws ec2 delete-security-group --group-id "$SG_ID" 2>/dev/null || true
+              echo "[OK] Deleted: $sg_name ($SG_ID)"
+            fi
+          done
+
+      - name: Delete NAT Gateway and Elastic IP
+        run: |
+          VPC_ID=${{ steps.find_vpc.outputs.vpc_id }}
+          [ "$VPC_ID" = "None" ] && exit 0
+
+          NAT_IDS=$(aws ec2 describe-nat-gateways \
+            --filter "Name=vpc-id,Values=$VPC_ID" "Name=state,Values=available,pending" \
+            --query 'NatGateways[].NatGatewayId' --output text)
+
+          for NAT_ID in $NAT_IDS; do
+            aws ec2 delete-nat-gateway --nat-gateway-id "$NAT_ID"
+            echo "[OK] Deleting NAT GW: $NAT_ID"
+          done
+
+          # Wait for NAT GW deletion
+          if [ -n "$NAT_IDS" ]; then
+            echo "Waiting for NAT GW deletion (60s)..."
+            sleep 60
+          fi
+
+          # Release Elastic IPs tagged with Project
+          EIP_ALLOCS=$(aws ec2 describe-addresses \
+            --filters "Name=tag:Project,Values=${{ env.PROJECT_TAG }}" \
+            --query 'Addresses[].AllocationId' --output text 2>/dev/null)
+          for ALLOC in $EIP_ALLOCS; do
+            aws ec2 release-address --allocation-id "$ALLOC" 2>/dev/null || true
+            echo "[OK] Released EIP: $ALLOC"
+          done
+
+      - name: Detach and delete Internet Gateway
+        run: |
+          VPC_ID=${{ steps.find_vpc.outputs.vpc_id }}
+          [ "$VPC_ID" = "None" ] && exit 0
+
+          IGW_ID=$(aws ec2 describe-internet-gateways \
+            --filters "Name=attachment.vpc-id,Values=$VPC_ID" \
+            --query 'InternetGateways[0].InternetGatewayId' --output text 2>/dev/null || echo "None")
+
+          if [ "$IGW_ID" != "None" ] && [ -n "$IGW_ID" ]; then
+            aws ec2 detach-internet-gateway --internet-gateway-id "$IGW_ID" --vpc-id "$VPC_ID"
+            aws ec2 delete-internet-gateway --internet-gateway-id "$IGW_ID"
+            echo "[OK] Deleted IGW: $IGW_ID"
+          fi
+
+      - name: Delete subnets
+        run: |
+          VPC_ID=${{ steps.find_vpc.outputs.vpc_id }}
+          [ "$VPC_ID" = "None" ] && exit 0
+
+          SUBNET_IDS=$(aws ec2 describe-subnets \
+            --filters "Name=vpc-id,Values=$VPC_ID" \
+            --query 'Subnets[].SubnetId' --output text)
+
+          for SID in $SUBNET_IDS; do
+            aws ec2 delete-subnet --subnet-id "$SID" 2>/dev/null || true
+            echo "[OK] Deleted subnet: $SID"
+          done
+
+      - name: Delete route tables
+        run: |
+          VPC_ID=${{ steps.find_vpc.outputs.vpc_id }}
+          [ "$VPC_ID" = "None" ] && exit 0
+
+          # Only delete custom route tables (not the main one)
+          RT_IDS=$(aws ec2 describe-route-tables \
+            --filters "Name=vpc-id,Values=$VPC_ID" "Name=tag:Project,Values=${{ env.PROJECT_TAG }}" \
+            --query 'RouteTables[].RouteTableId' --output text)
+
+          for RT in $RT_IDS; do
+            # Disassociate first
+            ASSOC_IDS=$(aws ec2 describe-route-tables --route-table-ids "$RT" \
+              --query 'RouteTables[0].Associations[?!Main].RouteTableAssociationId' --output text)
+            for AID in $ASSOC_IDS; do
+              aws ec2 disassociate-route-table --association-id "$AID" 2>/dev/null || true
+            done
+            aws ec2 delete-route-table --route-table-id "$RT" 2>/dev/null || true
+            echo "[OK] Deleted route table: $RT"
+          done
+
+      - name: Delete VPC
+        run: |
+          VPC_ID=${{ steps.find_vpc.outputs.vpc_id }}
+          [ "$VPC_ID" = "None" ] && echo "No VPC to delete" && exit 0
+
+          aws ec2 delete-vpc --vpc-id "$VPC_ID"
+          echo "[OK] Deleted VPC: $VPC_ID"
+
+      - name: Delete SSH key pair
+        run: |
+          aws ec2 delete-key-pair --key-name vprofile-key 2>/dev/null || true
+          echo "[OK] Deleted key pair: vprofile-key"
+
+      - name: Delete SSM parameter
+        run: |
+          aws ssm delete-parameter --name "/vprofile/ssh-key" 2>/dev/null || true
+          echo "[OK] Cleaned up SSM parameter"
+
+      - name: Cleanup summary
+        run: |
+          echo ""
+          echo "+========================================+"
+          echo "|       FULL CLEANUP COMPLETE            |"
+          echo "+========================================+"
+          echo ""
+          echo "  Deleted:"
+          echo "    * All EC2 instances (control node + 30 servers)"
+          echo "    * Application Load Balancer + target group"
+          echo "    * All security groups (5)"
+          echo "    * NAT Gateway + Elastic IP"
+          echo "    * Internet Gateway"
+          echo "    * 6 subnets"
+          echo "    * Route tables"
+          echo "    * VPC"
+          echo "    * SSH key pair"
+          echo ""
+          echo "  Preserved:"
+          echo "    * S3 bucket: ${{ env.S3_BUCKET }}"
+          echo "    * IAM role: ${{ env.IAM_PROFILE }}"
+          echo ""

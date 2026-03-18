@@ -1,0 +1,273 @@
+---
+- name: Provision Web Tier Servers (10 servers in public subnets)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - ../vars/servers.yml
+    - ../vars/security_groups_output.yml
+    - ../vars/output_vars.yml
+
+  tasks:
+    - name: Display Web Tier provisioning info
+      debug:
+        msg: |
+          [WEB] PROVISIONING WEB TIER
+          ------------------------------------------
+          Servers: 10 (vprofile-web-01 to vprofile-web-10)
+          Subnets: Public (pubsub1, pubsub2, pubsub3)
+          Security Group: {{ web_tier_sg_id }}
+          Instance Type: {{ instance_type }}
+          Region: {{ region }}
+
+    - name: Provision Web Tier Servers
+      amazon.aws.ec2_instance:
+        region: "{{ region }}"
+        image_id: "{{ ubuntu_22_04_ami }}"
+        instance_type: "{{ instance_type }}"
+        key_name: "{{ key_name }}"
+        security_group: "{{ web_tier_sg_id }}"
+        vpc_subnet_id: "{{ public_subnets[item.subnet_index].subnet_id }}"
+        ebs_optimized: false
+        detailed_monitoring: false
+        network:
+          assign_public_ip: false
+          delete_on_termination: true
+        tags:
+          Name: "{{ item.name }}"
+          Tier: "{{ item.tier }}"
+          Role: "{{ item.role }}"
+          Project: "{{ tags_common.Project }}"
+          Owner: "{{ tags_common.Owner }}"
+          ManagedBy: "{{ tags_common.ManagedBy }}"
+        wait: true
+        state: present
+      loop: "{{ web_servers }}"
+      register: web_instances_result
+
+    - name: Wait for Web Tier instances to be running
+      amazon.aws.ec2_instance_info:
+        instance_ids: "{{ web_instances_result.results | map(attribute='instances') | flatten | map(attribute='instance_id') | list }}"
+        region: "{{ region }}"
+      register: web_instances_info
+      until: web_instances_info.instances | selectattr('state.name', 'equalto', 'running') | list | length == 10
+      retries: 30
+      delay: 5
+
+    - name: Store Web Tier instances
+      set_fact:
+        web_tier_instances: "{{ web_instances_info.instances }}"
+
+- name: Provision App Tier Servers (10 servers in private subnets)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - ../vars/servers.yml
+    - ../vars/security_groups_output.yml
+    - ../vars/output_vars.yml
+
+  tasks:
+    - name: Display App Tier provisioning info
+      debug:
+        msg: |
+          [APP] PROVISIONING APP TIER
+          ------------------------------------------
+          Servers: 10 (vprofile-app-01 to vprofile-app-10)
+          Subnets: Private (privsub1, privsub2, privsub3)
+          Security Group: {{ app_tier_sg_id }}
+          Instance Type: {{ instance_type }}
+          Region: {{ region }}
+
+    - name: Provision App Tier Servers
+      amazon.aws.ec2_instance:
+        region: "{{ region }}"
+        image_id: "{{ ubuntu_22_04_ami }}"
+        instance_type: "{{ instance_type }}"
+        key_name: "{{ key_name }}"
+        security_group: "{{ app_tier_sg_id }}"
+        vpc_subnet_id: "{{ private_subnets[item.subnet_index].subnet_id }}"
+        ebs_optimized: false
+        detailed_monitoring: false
+        network:
+          assign_public_ip: false
+          delete_on_termination: true
+        tags:
+          Name: "{{ item.name }}"
+          Tier: "{{ item.tier }}"
+          Role: "{{ item.role }}"
+          Project: "{{ tags_common.Project }}"
+          Owner: "{{ tags_common.Owner }}"
+          ManagedBy: "{{ tags_common.ManagedBy }}"
+        wait: true
+        state: present
+      loop: "{{ app_servers }}"
+      register: app_instances_result
+
+    - name: Wait for App Tier instances to be running
+      amazon.aws.ec2_instance_info:
+        instance_ids: "{{ app_instances_result.results | map(attribute='instances') | flatten | map(attribute='instance_id') | list }}"
+        region: "{{ region }}"
+      register: app_instances_info
+      until: app_instances_info.instances | selectattr('state.name', 'equalto', 'running') | list | length == 10
+      retries: 30
+      delay: 5
+
+    - name: Store App Tier instances
+      set_fact:
+        app_tier_instances: "{{ app_instances_info.instances }}"
+
+- name: Provision Database Tier Servers (10 servers in private subnets)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - ../vars/servers.yml
+    - ../vars/security_groups_output.yml
+    - ../vars/output_vars.yml
+
+  tasks:
+    - name: Display Database Tier provisioning info
+      debug:
+        msg: |
+          [DB] PROVISIONING DATABASE TIER
+          ------------------------------------------
+          Servers: 10 (vprofile-db-01 to vprofile-db-10)
+          Subnets: Private (privsub1, privsub2, privsub3)
+          Security Group: {{ db_tier_sg_id }}
+          Instance Type: {{ instance_type }}
+          Region: {{ region }}
+          Egress: DENY ALL [BLOCKED] (no outbound traffic)
+
+    - name: Provision Database Tier Servers
+      amazon.aws.ec2_instance:
+        region: "{{ region }}"
+        image_id: "{{ ubuntu_22_04_ami }}"
+        instance_type: "{{ instance_type }}"
+        key_name: "{{ key_name }}"
+        security_group: "{{ db_tier_sg_id }}"
+        vpc_subnet_id: "{{ private_subnets[item.subnet_index].subnet_id }}"
+        ebs_optimized: false
+        detailed_monitoring: false
+        network:
+          assign_public_ip: false
+          delete_on_termination: true
+        tags:
+          Name: "{{ item.name }}"
+          Tier: "{{ item.tier }}"
+          Role: "{{ item.role }}"
+          Project: "{{ tags_common.Project }}"
+          Owner: "{{ tags_common.Owner }}"
+          ManagedBy: "{{ tags_common.ManagedBy }}"
+        wait: true
+        state: present
+      loop: "{{ db_servers }}"
+      register: db_instances_result
+
+    - name: Wait for Database Tier instances to be running
+      amazon.aws.ec2_instance_info:
+        instance_ids: "{{ db_instances_result.results | map(attribute='instances') | flatten | map(attribute='instance_id') | list }}"
+        region: "{{ region }}"
+      register: db_instances_info
+      until: db_instances_info.instances | selectattr('state.name', 'equalto', 'running') | list | length == 10
+      retries: 30
+      delay: 5
+
+    - name: Store Database Tier instances
+      set_fact:
+        db_tier_instances: "{{ db_instances_info.instances }}"
+
+- name: Generate servers output and update inventory
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - ../vars/servers.yml
+
+  tasks:
+    - name: Generate servers output file
+      copy:
+        content: |
+          ---
+          # Servers Output - Provisioned 3-Tier Architecture
+          # Timestamp: {{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}
+
+          web_tier_instances:
+          {% for instance in web_tier_instances %}
+            - name: {{ instance.tags.Name }}
+              instance_id: {{ instance.instance_id }}
+              private_ip: {{ instance.private_ip_address }}
+              subnet_id: {{ instance.subnet_id }}
+              az: {{ instance.placement.availability_zone }}
+              state: {{ instance.state.name }}
+          {% endfor %}
+
+          app_tier_instances:
+          {% for instance in app_tier_instances %}
+            - name: {{ instance.tags.Name }}
+              instance_id: {{ instance.instance_id }}
+              private_ip: {{ instance.private_ip_address }}
+              subnet_id: {{ instance.subnet_id }}
+              az: {{ instance.placement.availability_zone }}
+              state: {{ instance.state.name }}
+          {% endfor %}
+
+          db_tier_instances:
+          {% for instance in db_tier_instances %}
+            - name: {{ instance.tags.Name }}
+              instance_id: {{ instance.instance_id }}
+              private_ip: {{ instance.private_ip_address }}
+              subnet_id: {{ instance.subnet_id }}
+              az: {{ instance.placement.availability_zone }}
+              state: {{ instance.state.name }}
+          {% endfor %}
+
+          summary:
+            web_tier_count: {{ web_tier_instances | length }}
+            app_tier_count: {{ app_tier_instances | length }}
+            db_tier_count: {{ db_tier_instances | length }}
+            total_instances: {{ (web_tier_instances | length) + (app_tier_instances | length) + (db_tier_instances | length) }}
+        dest: ../vars/servers_output.yml
+
+    - name: Display Provisioning Summary
+      debug:
+        msg: |
+          +============================================================+
+          |       30 Servers Provisioned Successfully (3-Tier)         |
+          +============================================================+
+
+          [WEB] WEB TIER (Public Subnets)
+          --------------------------------------------------------------
+          {% for instance in web_tier_instances %}
+          [OK] {{ instance.tags.Name }}: {{ instance.private_ip_address }} ({{ instance.placement.availability_zone }})
+          {% endfor %}
+
+          [APP] APP TIER (Private Subnets)
+          --------------------------------------------------------------
+          {% for instance in app_tier_instances %}
+          [OK] {{ instance.tags.Name }}: {{ instance.private_ip_address }} ({{ instance.placement.availability_zone }})
+          {% endfor %}
+
+          [DB] DATABASE TIER (Private Subnets)
+          --------------------------------------------------------------
+          {% for instance in db_tier_instances %}
+          [OK] {{ instance.tags.Name }}: {{ instance.private_ip_address }} ({{ instance.placement.availability_zone }})
+          {% endfor %}
+
+          [STATS] SUMMARY
+          --------------------------------------------------------------
+          Total Instances: {{ (web_tier_instances | length) + (app_tier_instances | length) + (db_tier_instances | length) }}
+          Web Tier:        {{ web_tier_instances | length }} servers in public subnets
+          App Tier:        {{ app_tier_instances | length }} servers in private subnets
+          Database Tier:   {{ db_tier_instances | length }} servers in private subnets
+          Region:          {{ region }}
+
+          [OK] Output saved to: ../vars/servers_output.yml
+          [OK] Next steps:
+             1. Test connectivity: ansible -i inventory/aws_ec2.yml web_tier -m ping
+             2. Install packages: ansible-playbook playbooks/package_install.yml
+             3. Apply patches: ansible-playbook playbooks/patching.yml
