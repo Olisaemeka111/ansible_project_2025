@@ -273,14 +273,41 @@ jobs:
           KEY_EXISTS=$(aws ec2 describe-key-pairs --key-names vprofile-key \
             --query 'KeyPairs[0].KeyName' --output text 2>/dev/null || echo "None")
 
-          # Check if private key exists in S3
-          S3_KEY_EXISTS=$(aws s3 ls s3://${{ env.S3_BUCKET }}/keys/vprofile-key.pem 2>/dev/null && echo "yes" || echo "no")
+          # Check if private key exists in S3 (redirect ls output to /dev/null)
+          if aws s3 ls s3://${{ env.S3_BUCKET }}/keys/vprofile-key.pem >/dev/null 2>&1; then
+            S3_KEY_EXISTS="yes"
+          else
+            S3_KEY_EXISTS="no"
+          fi
+
+          echo "Key in AWS: $KEY_EXISTS | Key in S3: $S3_KEY_EXISTS"
+
+          # Check if instances already exist with this key
+          EXISTING_INSTANCES=$(aws ec2 describe-instances \
+            --filters "Name=tag:Project,Values=${{ env.PROJECT_TAG }}" \
+                      "Name=instance-state-name,Values=running" \
+            --query 'Reservations[].Instances[].InstanceId' --output text 2>/dev/null | wc -w)
+          echo "Running project instances: $EXISTING_INSTANCES"
 
           if [ "$KEY_EXISTS" = "vprofile-key" ] && [ "$S3_KEY_EXISTS" = "yes" ]; then
             echo "[OK] Reusing existing key pair (matches running instances)"
             aws s3 cp s3://${{ env.S3_BUCKET }}/keys/vprofile-key.pem /tmp/vprofile-key.pem
             chmod 600 /tmp/vprofile-key.pem
           else
+            # If instances exist with old key, terminate them first
+            if [ "$EXISTING_INSTANCES" -gt 1 ]; then
+              echo "[WARN] Terminating $EXISTING_INSTANCES instances created with old key pair..."
+              INSTANCE_IDS=$(aws ec2 describe-instances \
+                --filters "Name=tag:Project,Values=${{ env.PROJECT_TAG }}" \
+                          "Name=tag:Tier,Values=web,app,db" \
+                          "Name=instance-state-name,Values=running" \
+                --query 'Reservations[].Instances[].InstanceId' --output text 2>/dev/null)
+              if [ -n "$INSTANCE_IDS" ]; then
+                aws ec2 terminate-instances --instance-ids $INSTANCE_IDS >/dev/null 2>&1 || true
+                echo "[OK] Terminated old instances"
+              fi
+            fi
+
             echo "Creating new key pair..."
             aws ec2 delete-key-pair --key-name vprofile-key 2>/dev/null || true
             aws ec2 create-key-pair \
