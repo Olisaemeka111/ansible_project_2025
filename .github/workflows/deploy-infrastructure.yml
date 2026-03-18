@@ -277,14 +277,12 @@ jobs:
             --query 'KeyMaterial' --output text > /tmp/vprofile-key.pem
           chmod 600 /tmp/vprofile-key.pem
 
-          # Store private key in SSM Parameter Store for retrieval by control node
-          aws ssm put-parameter \
-            --name "/vprofile/ssh-key" \
-            --type "SecureString" \
-            --value "$(cat /tmp/vprofile-key.pem)" \
-            --overwrite
+          # Upload private key to S3 (encrypted at rest with SSE)
+          aws s3 cp /tmp/vprofile-key.pem \
+            s3://${{ env.S3_BUCKET }}/keys/vprofile-key.pem \
+            --sse AES256
 
-          echo "[OK] Created key pair 'vprofile-key' and stored in SSM"
+          echo "[OK] Created key pair and uploaded to S3"
 
       # ----------------------------------------------------------------
       # STEP 7: GENERATE VARS FILES WITH NEW IDS
@@ -541,18 +539,17 @@ jobs:
         run: |
           INSTANCE_ID=${{ steps.control_node.outputs.instance_id }}
 
-          # Control node retrieves the key from SSM Parameter Store directly
+          # Control node downloads key from S3 (simple, no escaping issues)
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "$INSTANCE_ID" \
             --document-name "AWS-RunShellScript" \
             --timeout-seconds 60 \
             --parameters commands='[
               "mkdir -p /home/ubuntu/.ssh",
-              "aws ssm get-parameter --name /vprofile/ssh-key --with-decryption --query Parameter.Value --output text --region us-east-2 > /home/ubuntu/.ssh/vprofile-key.pem",
+              "aws s3 cp s3://${{ env.S3_BUCKET }}/keys/vprofile-key.pem /home/ubuntu/.ssh/vprofile-key.pem",
               "chmod 600 /home/ubuntu/.ssh/vprofile-key.pem",
               "chown ubuntu:ubuntu /home/ubuntu/.ssh/vprofile-key.pem",
-              "ls -la /home/ubuntu/.ssh/vprofile-key.pem",
-              "echo [OK] SSH key deployed from SSM Parameter Store"
+              "echo [OK] SSH key deployed from S3"
             ]' \
             --query 'Command.CommandId' --output text)
 
@@ -1053,10 +1050,10 @@ jobs:
           aws ec2 delete-key-pair --key-name vprofile-key 2>/dev/null || true
           echo "[OK] Deleted key pair: vprofile-key"
 
-      - name: Delete SSM parameter
+      - name: Delete SSH key from S3
         run: |
-          aws ssm delete-parameter --name "/vprofile/ssh-key" 2>/dev/null || true
-          echo "[OK] Cleaned up SSM parameter"
+          aws s3 rm s3://${{ env.S3_BUCKET }}/keys/vprofile-key.pem 2>/dev/null || true
+          echo "[OK] Cleaned up SSH key from S3"
 
       - name: Cleanup summary
         run: |
