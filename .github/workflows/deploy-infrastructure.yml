@@ -266,23 +266,34 @@ jobs:
       # ----------------------------------------------------------------
       # STEP 6: CREATE SSH KEY PAIR
       # ----------------------------------------------------------------
-      - name: Create SSH key pair
+      - name: Create or reuse SSH key pair
         id: keypair
         run: |
-          # Always delete and recreate to ensure we have the private key
-          aws ec2 delete-key-pair --key-name vprofile-key 2>/dev/null || true
+          # Check if key pair already exists in AWS
+          KEY_EXISTS=$(aws ec2 describe-key-pairs --key-names vprofile-key \
+            --query 'KeyPairs[0].KeyName' --output text 2>/dev/null || echo "None")
 
-          aws ec2 create-key-pair \
-            --key-name vprofile-key \
-            --query 'KeyMaterial' --output text > /tmp/vprofile-key.pem
-          chmod 600 /tmp/vprofile-key.pem
+          # Check if private key exists in S3
+          S3_KEY_EXISTS=$(aws s3 ls s3://${{ env.S3_BUCKET }}/keys/vprofile-key.pem 2>/dev/null && echo "yes" || echo "no")
 
-          # Upload private key to S3 (encrypted at rest with SSE)
-          aws s3 cp /tmp/vprofile-key.pem \
-            s3://${{ env.S3_BUCKET }}/keys/vprofile-key.pem \
-            --sse AES256
+          if [ "$KEY_EXISTS" = "vprofile-key" ] && [ "$S3_KEY_EXISTS" = "yes" ]; then
+            echo "[OK] Reusing existing key pair (matches running instances)"
+            aws s3 cp s3://${{ env.S3_BUCKET }}/keys/vprofile-key.pem /tmp/vprofile-key.pem
+            chmod 600 /tmp/vprofile-key.pem
+          else
+            echo "Creating new key pair..."
+            aws ec2 delete-key-pair --key-name vprofile-key 2>/dev/null || true
+            aws ec2 create-key-pair \
+              --key-name vprofile-key \
+              --query 'KeyMaterial' --output text > /tmp/vprofile-key.pem
+            chmod 600 /tmp/vprofile-key.pem
 
-          echo "[OK] Created key pair and uploaded to S3"
+            # Upload private key to S3 (encrypted at rest with SSE)
+            aws s3 cp /tmp/vprofile-key.pem \
+              s3://${{ env.S3_BUCKET }}/keys/vprofile-key.pem \
+              --sse AES256
+            echo "[OK] Created new key pair and uploaded to S3"
+          fi
 
       # ----------------------------------------------------------------
       # STEP 7: GENERATE VARS FILES WITH NEW IDS
