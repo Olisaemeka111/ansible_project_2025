@@ -16,10 +16,9 @@ packages_common:
   - vim
   - tree
   - jq
-  - aws-cli
+  - awscli
   - ca-certificates
   - openssl
-  - ssl-cert
 
 # ============================================================================
 # WEB TIER PACKAGES
@@ -90,17 +89,13 @@ docker_packages:
 packages_db:
   - mysql-client              # MySQL client tools
   - postgresql-client         # PostgreSQL client tools
-  - mongodb-mongosh           # MongoDB shell
   - redis-tools               # Redis CLI
   - mariadb-client            # MariaDB client (compatible with MySQL)
   - sqlite3                   # SQLite client
-  - pgAdmin4-desktop          # PostgreSQL GUI (optional)
-  - mongodb-database-tools    # MongoDB utilities
 
 # Monitoring/Logging on all DB servers
 packages_db_monitoring:
   - collectd                  # System monitoring
-  - telegraf                  # Metrics collection
 
 # ============================================================================
 # TIER-SPECIFIC GROUPS (for easy reference in playbooks)

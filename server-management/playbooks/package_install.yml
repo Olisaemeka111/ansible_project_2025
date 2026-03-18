@@ -212,12 +212,6 @@
       changed_when: false
       ignore_errors: yes
 
-    - name: Verify MongoDB tools
-      ansible.builtin.command: mongosh --version
-      register: mongo_version
-      changed_when: false
-      ignore_errors: yes
-
     - name: Verify Redis tools
       ansible.builtin.command: redis-cli --version
       register: redis_version
@@ -239,9 +233,6 @@
 
           PostgreSQL Client:
           {{ psql_version.stdout | default('Not installed') }}
-
-          MongoDB Shell:
-          {{ mongo_version.stdout | default('Not installed') }}
 
           Redis CLI:
           {{ redis_version.stdout | default('Not installed') }}
