@@ -589,58 +589,149 @@ jobs:
             --query '{Status:Status,Output:StandardOutputContent}' --output json
 
       # ----------------------------------------------------------------
-      # STEP 15: RUN FULL DEPLOYMENT (verbose)
+      # STEP 15a: CREATE SECURITY GROUPS
       # ----------------------------------------------------------------
-      - name: Run deployment (all phases)
+      - name: "Phase 1: Create Security Groups"
         run: |
           INSTANCE_ID=${{ steps.control_node.outputs.instance_id }}
-
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "$INSTANCE_ID" \
             --document-name "AWS-RunShellScript" \
-            --timeout-seconds 2400 \
-            --output-s3-bucket-name "${{ env.S3_BUCKET }}" \
-            --output-s3-key-prefix "ssm-output/deploy" \
+            --timeout-seconds 300 \
             --parameters commands='[
-              "cd /home/ubuntu/deploy/server-management && export PATH=$PATH:/home/ubuntu/.local/bin:/usr/local/bin && export TERM=xterm && export HOME=/home/ubuntu && export ANSIBLE_VERBOSITY=0 && sudo -u ubuntu -E bash -c \"export PATH=$PATH:/home/ubuntu/.local/bin:/usr/local/bin && cd /home/ubuntu/deploy/server-management && ./deploy.sh deploy --yes\" 2>&1"
+              "sudo -u ubuntu bash -c \"cd /home/ubuntu/deploy/server-management && export PATH=$PATH:/home/ubuntu/.local/bin:/usr/local/bin && ansible-playbook playbooks/security_groups.yml\" 2>&1"
             ]' \
             --query 'Command.CommandId' --output text)
-
-          echo "Deployment command: $COMMAND_ID"
-
-          for i in $(seq 1 80); do
-            STATUS=$(aws ssm get-command-invocation \
-              --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" \
-              --query 'Status' --output text 2>/dev/null || echo "Pending")
+          echo "Command: $COMMAND_ID"
+          for i in $(seq 1 20); do
+            STATUS=$(aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --query 'Status' --output text 2>/dev/null || echo "Pending")
             case "$STATUS" in
-              Success)
-                echo "[OK] Deployment completed"
-                break ;;
+              Success) echo "[OK] Security groups created"; break ;;
               Failed|TimedOut|Cancelled)
-                echo "[FAIL] Deployment $STATUS"
-                echo "========== STDERR =========="
-                aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" \
-                  --query 'StandardErrorContent' --output text
-                echo "========== STDOUT (last 200 lines) =========="
-                aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" \
-                  --query 'StandardOutputContent' --output text | tail -200
-                echo "========== FULL LOG IN S3 =========="
-                echo "s3://${{ env.S3_BUCKET }}/ssm-output/deploy/"
-                LATEST_LOG=$(aws s3 ls s3://${{ env.S3_BUCKET }}/logs/ --recursive | sort | tail -1 | awk '{print $4}') || true
-                if [ -n "$LATEST_LOG" ]; then
-                  echo "========== DEPLOY LOG (last 100 lines) =========="
-                  aws s3 cp "s3://${{ env.S3_BUCKET }}/$LATEST_LOG" - | tail -100
-                fi
+                echo "[FAIL] Security groups $STATUS"
+                aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --query 'StandardOutputContent' --output text
+                aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --query 'StandardErrorContent' --output text
                 exit 1 ;;
-              *) echo "  [$i/80] $STATUS - waiting 30s..."; sleep 30 ;;
+              *) echo "  [$i/20] $STATUS - waiting 15s..."; sleep 15 ;;
             esac
           done
+          aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --query 'StandardOutputContent' --output text
 
-          echo ""
-          echo "========== DEPLOYMENT OUTPUT =========="
-          aws ssm get-command-invocation \
-            --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" \
-            --query 'StandardOutputContent' --output text
+      # ----------------------------------------------------------------
+      # STEP 15b: PROVISION 30 SERVERS
+      # ----------------------------------------------------------------
+      - name: "Phase 2: Provision 30 Servers (3 Tiers)"
+        run: |
+          INSTANCE_ID=${{ steps.control_node.outputs.instance_id }}
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --timeout-seconds 900 \
+            --parameters commands='[
+              "sudo -u ubuntu bash -c \"cd /home/ubuntu/deploy/server-management && export PATH=$PATH:/home/ubuntu/.local/bin:/usr/local/bin && ansible-playbook playbooks/provision_servers.yml\" 2>&1"
+            ]' \
+            --query 'Command.CommandId' --output text)
+          echo "Command: $COMMAND_ID"
+          for i in $(seq 1 40); do
+            STATUS=$(aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --query 'Status' --output text 2>/dev/null || echo "Pending")
+            case "$STATUS" in
+              Success) echo "[OK] 30 servers provisioned"; break ;;
+              Failed|TimedOut|Cancelled)
+                echo "[FAIL] Provisioning $STATUS"
+                aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --query 'StandardOutputContent' --output text
+                aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --query 'StandardErrorContent' --output text
+                exit 1 ;;
+              *) echo "  [$i/40] $STATUS - waiting 15s..."; sleep 15 ;;
+            esac
+          done
+          aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --query 'StandardOutputContent' --output text
+
+      # ----------------------------------------------------------------
+      # STEP 15c: VERIFY SSH CONNECTIVITY
+      # ----------------------------------------------------------------
+      - name: "Phase 3: Verify SSH Connectivity"
+        run: |
+          INSTANCE_ID=${{ steps.control_node.outputs.instance_id }}
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --timeout-seconds 120 \
+            --parameters commands='[
+              "sudo -u ubuntu bash -c \"cd /home/ubuntu/deploy/server-management && export PATH=$PATH:/home/ubuntu/.local/bin:/usr/local/bin && echo === SSH Key Check === && ls -la /home/ubuntu/.ssh/vprofile-key.pem && echo === Key Fingerprint === && ssh-keygen -lf /home/ubuntu/.ssh/vprofile-key.pem && echo === Ansible Config === && cat ansible.cfg && echo === Inventory Test === && ansible-inventory -i inventory/aws_ec2.yml --list 2>/dev/null | python3 -c 'import sys,json; d=json.load(sys.stdin); [print(g,len(d[g].get(\\\"hosts\\\",[])),\\\"hosts\\\") for g in [\\\"web_tier\\\",\\\"app_tier\\\",\\\"db_tier\\\"] if g in d]' && echo === SSH Test to first web host === && FIRST_HOST=$(ansible-inventory -i inventory/aws_ec2.yml --list 2>/dev/null | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get(\\\"web_tier\\\",{}).get(\\\"hosts\\\",[\\\"\\\"])[0])') && echo Testing SSH to $FIRST_HOST && ssh -i /home/ubuntu/.ssh/vprofile-key.pem -o StrictHostKeyChecking=no -o ConnectTimeout=10 ubuntu@$FIRST_HOST echo SSH_OK 2>&1 || echo SSH_FAILED\" 2>&1"
+            ]' \
+            --query 'Command.CommandId' --output text)
+          echo "Command: $COMMAND_ID"
+          for i in $(seq 1 10); do
+            STATUS=$(aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --query 'Status' --output text 2>/dev/null || echo "Pending")
+            case "$STATUS" in
+              Success) echo "[OK] SSH verified"; break ;;
+              Failed|TimedOut|Cancelled)
+                echo "[FAIL] SSH verification $STATUS"
+                aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --query 'StandardOutputContent' --output text
+                aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --query 'StandardErrorContent' --output text
+                exit 1 ;;
+              *) echo "  [$i/10] $STATUS - waiting 10s..."; sleep 10 ;;
+            esac
+          done
+          aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --query 'StandardOutputContent' --output text
+
+      # ----------------------------------------------------------------
+      # STEP 15d: INSTALL PACKAGES ON ALL TIERS
+      # ----------------------------------------------------------------
+      - name: "Phase 4: Install Packages (All Tiers)"
+        run: |
+          INSTANCE_ID=${{ steps.control_node.outputs.instance_id }}
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --timeout-seconds 1800 \
+            --parameters commands='[
+              "sudo -u ubuntu bash -c \"cd /home/ubuntu/deploy/server-management && export PATH=$PATH:/home/ubuntu/.local/bin:/usr/local/bin && ansible-playbook playbooks/package_install.yml\" 2>&1"
+            ]' \
+            --query 'Command.CommandId' --output text)
+          echo "Command: $COMMAND_ID"
+          for i in $(seq 1 60); do
+            STATUS=$(aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --query 'Status' --output text 2>/dev/null || echo "Pending")
+            case "$STATUS" in
+              Success) echo "[OK] Packages installed on all tiers"; break ;;
+              Failed|TimedOut|Cancelled)
+                echo "[FAIL] Package install $STATUS"
+                aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --query 'StandardOutputContent' --output text
+                aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --query 'StandardErrorContent' --output text
+                exit 1 ;;
+              *) echo "  [$i/60] $STATUS - waiting 30s..."; sleep 30 ;;
+            esac
+          done
+          aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --query 'StandardOutputContent' --output text
+
+      # ----------------------------------------------------------------
+      # STEP 15e: APPLY PATCHES
+      # ----------------------------------------------------------------
+      - name: "Phase 5: Apply Patches"
+        run: |
+          INSTANCE_ID=${{ steps.control_node.outputs.instance_id }}
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --timeout-seconds 1200 \
+            --parameters commands='[
+              "sudo -u ubuntu bash -c \"cd /home/ubuntu/deploy/server-management && export PATH=$PATH:/home/ubuntu/.local/bin:/usr/local/bin && ansible-playbook playbooks/patching.yml\" 2>&1"
+            ]' \
+            --query 'Command.CommandId' --output text)
+          echo "Command: $COMMAND_ID"
+          for i in $(seq 1 40); do
+            STATUS=$(aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --query 'Status' --output text 2>/dev/null || echo "Pending")
+            case "$STATUS" in
+              Success) echo "[OK] Patches applied"; break ;;
+              Failed|TimedOut|Cancelled)
+                echo "[FAIL] Patching $STATUS"
+                aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --query 'StandardOutputContent' --output text
+                aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --query 'StandardErrorContent' --output text
+                exit 1 ;;
+              *) echo "  [$i/40] $STATUS - waiting 30s..."; sleep 30 ;;
+            esac
+          done
+          aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --query 'StandardOutputContent' --output text
 
       # ----------------------------------------------------------------
       # STEP 16: CREATE APPLICATION LOAD BALANCER FOR WEB TIER
