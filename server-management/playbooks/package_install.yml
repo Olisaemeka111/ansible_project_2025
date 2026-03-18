@@ -171,6 +171,46 @@
       debug:
         msg: "[OK] All packages installed on {{ inventory_hostname }}"
 
+# ============================================================================
+# TEMPORARY: Open DB tier egress for package installation
+# ============================================================================
+- name: Open DB Tier egress temporarily for package installation
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - ../vars/security_groups_output.yml
+    - ../vars/output_vars.yml
+
+  tasks:
+    - name: Add temporary egress rules to DB tier SG
+      amazon.aws.ec2_group:
+        name: vprofile-db-tier-sg
+        description: "Database Tier - Restricted database servers (private subnets)"
+        vpc_id: "{{ vpc_id }}"
+        region: "{{ region }}"
+        purge_rules: false
+        purge_rules_egress: true
+        rules_egress:
+          - proto: udp
+            ports: [53]
+            cidr_ip: 0.0.0.0/0
+            rule_desc: "TEMP - DNS for package install"
+          - proto: tcp
+            ports: [443]
+            cidr_ip: 0.0.0.0/0
+            rule_desc: "TEMP - HTTPS for package install"
+          - proto: tcp
+            ports: [80]
+            cidr_ip: 0.0.0.0/0
+            rule_desc: "TEMP - HTTP for package install"
+        state: present
+
+    - name: Display temporary egress status
+      debug:
+        msg: "[OPEN] DB tier egress temporarily opened for package installation"
+
 - name: Install Packages on Database Tier
   hosts: db_tier
   serial: 10
@@ -244,3 +284,31 @@
     - name: Display installation status
       debug:
         msg: "[OK] Database tools installed on {{ inventory_hostname }}"
+
+# ============================================================================
+# LOCK DOWN: Remove DB tier egress after package installation
+# ============================================================================
+- name: Lock down DB Tier egress after package installation
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - ../vars/security_groups_output.yml
+    - ../vars/output_vars.yml
+
+  tasks:
+    - name: Remove temporary egress rules from DB tier SG
+      amazon.aws.ec2_group:
+        name: vprofile-db-tier-sg
+        description: "Database Tier - Restricted database servers (private subnets, no outbound)"
+        vpc_id: "{{ vpc_id }}"
+        region: "{{ region }}"
+        purge_rules: false
+        purge_rules_egress: true
+        rules_egress: []
+        state: present
+
+    - name: Display lockdown status
+      debug:
+        msg: "[LOCKED] DB tier egress locked down - no outbound traffic allowed"
