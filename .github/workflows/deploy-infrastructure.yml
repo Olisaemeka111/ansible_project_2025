@@ -21,6 +21,9 @@
 name: Deploy 3-Tier Infrastructure
 
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
     inputs:
       action:
@@ -48,7 +51,7 @@ jobs:
   deploy:
     name: Deploy Infrastructure
     runs-on: ubuntu-latest
-    if: ${{ github.event.inputs.action == 'deploy' }}
+    if: ${{ github.event_name == 'push' || github.event.inputs.action == 'deploy' }}
     timeout-minutes: 90
 
     steps:
