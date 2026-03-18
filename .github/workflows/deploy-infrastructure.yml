@@ -599,7 +599,7 @@ jobs:
             --document-name "AWS-RunShellScript" \
             --timeout-seconds 300 \
             --parameters commands='[
-              "sudo -u ubuntu bash -c \"cd /home/ubuntu/deploy/server-management && export PATH=$PATH:/home/ubuntu/.local/bin:/usr/local/bin && ansible-playbook playbooks/security_groups.yml\" 2>&1"
+              "sudo -u ubuntu -H bash -c \"cd /home/ubuntu/deploy/server-management && export PATH=$PATH:/home/ubuntu/.local/bin:/usr/local/bin && ansible-playbook playbooks/security_groups.yml\" 2>&1"
             ]' \
             --query 'Command.CommandId' --output text)
           echo "Command: $COMMAND_ID"
@@ -628,7 +628,7 @@ jobs:
             --document-name "AWS-RunShellScript" \
             --timeout-seconds 900 \
             --parameters commands='[
-              "sudo -u ubuntu bash -c \"cd /home/ubuntu/deploy/server-management && export PATH=$PATH:/home/ubuntu/.local/bin:/usr/local/bin && ansible-playbook playbooks/provision_servers.yml\" 2>&1"
+              "sudo -u ubuntu -H bash -c \"cd /home/ubuntu/deploy/server-management && export PATH=$PATH:/home/ubuntu/.local/bin:/usr/local/bin && ansible-playbook playbooks/provision_servers.yml\" 2>&1"
             ]' \
             --query 'Command.CommandId' --output text)
           echo "Command: $COMMAND_ID"
@@ -657,7 +657,7 @@ jobs:
             --document-name "AWS-RunShellScript" \
             --timeout-seconds 120 \
             --parameters commands='[
-              "echo === SSH Key Check === && ls -la /home/ubuntu/.ssh/vprofile-key.pem && echo === Key Fingerprint === && ssh-keygen -lf /home/ubuntu/.ssh/vprofile-key.pem && echo === Ansible Config === && cat /home/ubuntu/deploy/server-management/ansible.cfg && echo === Inventory Host Count === && cd /home/ubuntu/deploy/server-management && sudo -u ubuntu bash -c \"export PATH=$PATH:/home/ubuntu/.local/bin:/usr/local/bin && cd /home/ubuntu/deploy/server-management && ansible-inventory -i inventory/aws_ec2.yml --graph 2>/dev/null\" && echo === Ping Test Web Tier === && sudo -u ubuntu bash -c \"export PATH=$PATH:/home/ubuntu/.local/bin:/usr/local/bin && cd /home/ubuntu/deploy/server-management && ansible -i inventory/aws_ec2.yml web_tier -m ping --limit web_tier[0] 2>&1\" || echo PING_FAILED && echo === Manual SSH Test === && FIRST_IP=$(sudo -u ubuntu bash -c \"export PATH=$PATH:/home/ubuntu/.local/bin:/usr/local/bin && ansible-inventory -i /home/ubuntu/deploy/server-management/inventory/aws_ec2.yml --list 2>/dev/null\" | grep -oP '172\\.20\\.[0-9]+\\.[0-9]+' | head -1) && echo Testing SSH to $FIRST_IP && sudo -u ubuntu ssh -i /home/ubuntu/.ssh/vprofile-key.pem -o StrictHostKeyChecking=no -o ConnectTimeout=10 ubuntu@$FIRST_IP echo SSH_OK 2>&1 || echo SSH_FAILED"
+              "echo === SSH Key Check === && ls -la /home/ubuntu/.ssh/vprofile-key.pem && echo === Key Fingerprint === && ssh-keygen -lf /home/ubuntu/.ssh/vprofile-key.pem && echo === Ansible Config === && cat /home/ubuntu/deploy/server-management/ansible.cfg && echo === Inventory Host Count === && cd /home/ubuntu/deploy/server-management && sudo -u ubuntu -H bash -c \"export PATH=$PATH:/home/ubuntu/.local/bin:/usr/local/bin && cd /home/ubuntu/deploy/server-management && ansible-inventory -i inventory/aws_ec2.yml --graph 2>/dev/null\" && echo === Ping Test Web Tier === && sudo -u ubuntu -H bash -c \"export PATH=$PATH:/home/ubuntu/.local/bin:/usr/local/bin && cd /home/ubuntu/deploy/server-management && ansible -i inventory/aws_ec2.yml web_tier -m ping --limit web_tier[0] 2>&1\" || echo PING_FAILED && echo === Manual SSH Test === && FIRST_IP=$(sudo -u ubuntu -H bash -c \"export PATH=$PATH:/home/ubuntu/.local/bin:/usr/local/bin && ansible-inventory -i /home/ubuntu/deploy/server-management/inventory/aws_ec2.yml --list 2>/dev/null\" | grep -oP '172\\.20\\.[0-9]+\\.[0-9]+' | head -1) && echo Testing SSH to $FIRST_IP && sudo -u ubuntu ssh -i /home/ubuntu/.ssh/vprofile-key.pem -o StrictHostKeyChecking=no -o ConnectTimeout=10 ubuntu@$FIRST_IP echo SSH_OK 2>&1 || echo SSH_FAILED"
             ]' \
             --query 'Command.CommandId' --output text)
           echo "Command: $COMMAND_ID"
@@ -686,7 +686,7 @@ jobs:
             --document-name "AWS-RunShellScript" \
             --timeout-seconds 1800 \
             --parameters commands='[
-              "sudo -u ubuntu bash -c \"cd /home/ubuntu/deploy/server-management && export PATH=$PATH:/home/ubuntu/.local/bin:/usr/local/bin && ansible-playbook playbooks/package_install.yml\" 2>&1"
+              "sudo -u ubuntu -H bash -c \"cd /home/ubuntu/deploy/server-management && export PATH=$PATH:/home/ubuntu/.local/bin:/usr/local/bin && ansible-playbook playbooks/package_install.yml\" 2>&1"
             ]' \
             --query 'Command.CommandId' --output text)
           echo "Command: $COMMAND_ID"
@@ -715,7 +715,7 @@ jobs:
             --document-name "AWS-RunShellScript" \
             --timeout-seconds 1200 \
             --parameters commands='[
-              "sudo -u ubuntu bash -c \"cd /home/ubuntu/deploy/server-management && export PATH=$PATH:/home/ubuntu/.local/bin:/usr/local/bin && ansible-playbook playbooks/patching.yml\" 2>&1"
+              "sudo -u ubuntu -H bash -c \"cd /home/ubuntu/deploy/server-management && export PATH=$PATH:/home/ubuntu/.local/bin:/usr/local/bin && ansible-playbook playbooks/patching.yml\" 2>&1"
             ]' \
             --query 'Command.CommandId' --output text)
           echo "Command: $COMMAND_ID"
