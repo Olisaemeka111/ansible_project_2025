@@ -501,17 +501,7 @@ jobs:
             --document-name "AWS-RunShellScript" \
             --timeout-seconds 600 \
             --parameters commands='[
-              "set -e",
-              "echo === Bootstrap Start ===",
-              "sudo apt-get update -qq",
-              "sudo apt-get install -y -qq python3-pip python3-venv > /dev/null 2>&1",
-              "pip3 install --quiet ansible boto3 botocore",
-              "export PATH=$PATH:$HOME/.local/bin",
-              "ansible-galaxy collection install amazon.aws --force > /dev/null 2>&1",
-              "echo export PATH=\\$PATH:\\$HOME/.local/bin | sudo tee /etc/profile.d/ansible-path.sh > /dev/null",
-              "sudo pip3 install boto3 botocore > /dev/null 2>&1",
-              "echo === Bootstrap Complete ===",
-              "ansible --version | head -1"
+              "set -e && echo === Bootstrap Start === && apt-get update -qq && apt-get install -y -qq python3-pip python3-venv > /dev/null 2>&1 && pip3 install ansible boto3 botocore && export PATH=$PATH:/root/.local/bin:/home/ubuntu/.local/bin && ansible-galaxy collection install amazon.aws --force > /dev/null 2>&1 && echo export PATH=\\$PATH:\\$HOME/.local/bin > /etc/profile.d/ansible-path.sh && pip3 install boto3 botocore > /dev/null 2>&1 && echo === Bootstrap Complete === && ansible --version | head -1"
             ]' \
             --query 'Command.CommandId' --output text)
 
@@ -545,11 +535,7 @@ jobs:
             --document-name "AWS-RunShellScript" \
             --timeout-seconds 60 \
             --parameters commands='[
-              "mkdir -p /home/ubuntu/.ssh",
-              "aws s3 cp s3://${{ env.S3_BUCKET }}/keys/vprofile-key.pem /home/ubuntu/.ssh/vprofile-key.pem",
-              "chmod 600 /home/ubuntu/.ssh/vprofile-key.pem",
-              "chown ubuntu:ubuntu /home/ubuntu/.ssh/vprofile-key.pem",
-              "echo [OK] SSH key deployed from S3"
+              "mkdir -p /home/ubuntu/.ssh && aws s3 cp s3://${{ env.S3_BUCKET }}/keys/vprofile-key.pem /home/ubuntu/.ssh/vprofile-key.pem && chmod 600 /home/ubuntu/.ssh/vprofile-key.pem && chown ubuntu:ubuntu /home/ubuntu/.ssh/vprofile-key.pem && echo [OK] SSH key deployed from S3"
             ]' \
             --query 'Command.CommandId' --output text)
 
@@ -580,12 +566,7 @@ jobs:
             --document-name "AWS-RunShellScript" \
             --timeout-seconds 120 \
             --parameters commands='[
-              "mkdir -p /home/ubuntu/deploy",
-              "aws s3 sync s3://${{ env.S3_BUCKET }}/server-management/ /home/ubuntu/deploy/server-management/ --delete",
-              "chown -R ubuntu:ubuntu /home/ubuntu/deploy",
-              "chmod +x /home/ubuntu/deploy/server-management/deploy.sh",
-              "echo [OK] Code synced",
-              "cat /home/ubuntu/deploy/server-management/vars/output_vars.yml"
+              "mkdir -p /home/ubuntu/deploy && aws s3 sync s3://${{ env.S3_BUCKET }}/server-management/ /home/ubuntu/deploy/server-management/ --delete && chown -R ubuntu:ubuntu /home/ubuntu/deploy && chmod +x /home/ubuntu/deploy/server-management/deploy.sh && echo [OK] Code synced && ls -la /home/ubuntu/deploy/server-management/"
             ]' \
             --query 'Command.CommandId' --output text)
 
@@ -608,12 +589,7 @@ jobs:
             --document-name "AWS-RunShellScript" \
             --timeout-seconds 2400 \
             --parameters commands='[
-              "cd /home/ubuntu/deploy/server-management",
-              "export PATH=$PATH:/home/ubuntu/.local/bin",
-              "export TERM=xterm",
-              "export HOME=/home/ubuntu",
-              "export ANSIBLE_VERBOSITY=2",
-              "./deploy.sh deploy --yes 2>&1"
+              "cd /home/ubuntu/deploy/server-management && export PATH=$PATH:/home/ubuntu/.local/bin && export TERM=xterm && export HOME=/home/ubuntu && export ANSIBLE_VERBOSITY=2 && sudo -u ubuntu -E bash -c \"export PATH=$PATH:/home/ubuntu/.local/bin && cd /home/ubuntu/deploy/server-management && ./deploy.sh deploy --yes\" 2>&1"
             ]' \
             --query 'Command.CommandId' --output text)
 
