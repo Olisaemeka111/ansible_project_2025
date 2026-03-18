@@ -602,7 +602,7 @@ jobs:
             --output-s3-bucket-name "${{ env.S3_BUCKET }}" \
             --output-s3-key-prefix "ssm-output/deploy" \
             --parameters commands='[
-              "bash -c 'cd /home/ubuntu/deploy/server-management && export PATH=$PATH:/home/ubuntu/.local/bin:/usr/local/bin && export TERM=xterm && export HOME=/home/ubuntu && export ANSIBLE_VERBOSITY=0 && sudo -u ubuntu -E bash -c \"export PATH=$PATH:/home/ubuntu/.local/bin:/usr/local/bin && cd /home/ubuntu/deploy/server-management && ./deploy.sh deploy --yes\" 2>&1 | tee /tmp/deploy.log; EXIT_CODE=${PIPESTATUS[0]}; aws s3 cp /tmp/deploy.log s3://bus-terminal-deploy-156041437006/logs/deploy-output.log 2>/dev/null || true; exit $EXIT_CODE'"
+              "cd /home/ubuntu/deploy/server-management && export PATH=$PATH:/home/ubuntu/.local/bin:/usr/local/bin && export TERM=xterm && export HOME=/home/ubuntu && export ANSIBLE_VERBOSITY=0 && sudo -u ubuntu -E bash -c \"export PATH=$PATH:/home/ubuntu/.local/bin:/usr/local/bin && cd /home/ubuntu/deploy/server-management && ./deploy.sh deploy --yes\" 2>&1"
             ]' \
             --query 'Command.CommandId' --output text)
 
