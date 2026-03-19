@@ -90,7 +90,6 @@ packages_db:
   - mysql-client              # MySQL client tools
   - postgresql-client         # PostgreSQL client tools
   - redis-tools               # Redis CLI
-  - mariadb-client            # MariaDB client (compatible with MySQL)
   - sqlite3                   # SQLite client
 
 # Monitoring/Logging on all DB servers
