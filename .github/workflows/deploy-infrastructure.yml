@@ -35,6 +35,10 @@ on:
           - deploy
           - cleanup
 
+concurrency:
+  group: deploy-infrastructure
+  cancel-in-progress: true
+
 env:
   AWS_REGION: us-east-2
   VPC_CIDR: "172.20.0.0/16"
