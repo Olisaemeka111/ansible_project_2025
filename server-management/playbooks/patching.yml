@@ -1,6 +1,6 @@
 ---
-- name: Patch and Upgrade App Servers
-  hosts: app_servers
+- name: Patch and Upgrade All Servers
+  hosts: web_tier:app_tier:db_tier
   serial: 10
   become: true
 
@@ -73,7 +73,7 @@
           Patching Summary - {{ ansible_date_time.iso8601 }}
           ================================================
           Host: {{ inventory_hostname }}
-          Batch: {{ batch }}
+          Tier: {{ group_names | select('in', ['web_tier', 'app_tier', 'db_tier']) | first | default('unknown') }}
           IP: {{ ansible_host }}
 
           Packages Upgraded: {{ upgrade_result.changed }}
