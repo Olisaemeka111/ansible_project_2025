@@ -93,16 +93,16 @@
         .instances-table tbody tr:hover {
             background-color: #f9f9f9;
         }
-        .batch-badge {
+        .tier-badge {
             display: inline-block;
             padding: 4px 12px;
             border-radius: 20px;
             font-size: 0.85em;
             font-weight: 600;
         }
-        .batch-1 { background-color: #e3f2fd; color: #1976d2; }
-        .batch-2 { background-color: #f3e5f5; color: #7b1fa2; }
-        .batch-3 { background-color: #e8f5e9; color: #388e3c; }
+        .web_tier { background-color: #e3f2fd; color: #1976d2; }
+        .app_tier { background-color: #f3e5f5; color: #7b1fa2; }
+        .db_tier { background-color: #e8f5e9; color: #388e3c; }
         .metric-bar {
             width: 100%;
             height: 20px;
@@ -209,7 +209,7 @@
                     <tr>
                         <th>Instance</th>
                         <th>IP Address</th>
-                        <th>Batch</th>
+                        <th>Tier</th>
                         <th>Memory Usage</th>
                         <th>Disk Usage</th>
                         <th>CPU Load</th>
@@ -221,8 +221,8 @@
                         <td><strong>{{ metric.hostname }}</strong></td>
                         <td>{{ metric.private_ip }}</td>
                         <td>
-                            <span class="batch-badge {{ metric.batch }}">
-                                {{ metric.batch }}
+                            <span class="tier-badge {{ metric.tier | default('unknown') }}">
+                                {{ metric.tier | default('unknown') }}
                             </span>
                         </td>
                         <td>
