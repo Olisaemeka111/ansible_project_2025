@@ -1,6 +1,6 @@
 ---
-- name: Patch and Upgrade All Servers
-  hosts: web_tier:app_tier:db_tier
+- name: Patch and Upgrade Web Tier
+  hosts: web_tier
   serial: 10
   become: true
 
@@ -73,7 +73,7 @@
           Patching Summary - {{ ansible_date_time.iso8601 }}
           ================================================
           Host: {{ inventory_hostname }}
-          Tier: {{ group_names | select('in', ['web_tier', 'app_tier', 'db_tier']) | first | default('unknown') }}
+          Tier: web
           IP: {{ ansible_host }}
 
           Packages Upgraded: {{ upgrade_result.changed }}
@@ -86,3 +86,247 @@
         dest: "/tmp/patch_{{ inventory_hostname }}_{{ ansible_date_time.iso8601_basic_short }}.txt"
       delegate_to: localhost
       become: false
+
+- name: Patch and Upgrade App Tier
+  hosts: app_tier
+  serial: 10
+  become: true
+
+  pre_tasks:
+    - name: Check for running services before patching
+      shell: systemctl list-units --state=running --no-pager | grep -E '\.service' | wc -l
+      register: running_services
+      changed_when: false
+
+    - name: Display pre-patch service count
+      debug:
+        msg: "{{ inventory_hostname }} has {{ running_services.stdout }} running services"
+
+  tasks:
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Upgrade all packages (dist-upgrade)
+      ansible.builtin.apt:
+        upgrade: dist
+        autoremove: yes
+        autoclean: yes
+      register: upgrade_result
+
+    - name: Display upgraded packages
+      debug:
+        msg: "Upgraded packages on {{ inventory_hostname }}"
+      when: upgrade_result.changed
+
+    - name: Check if reboot is required
+      stat:
+        path: /var/run/reboot-required
+      register: reboot_required
+
+    - name: Reboot system if kernel was updated
+      ansible.builtin.reboot:
+        msg: "Reboot initiated by Ansible patching playbook"
+        connect_timeout: 5
+        reboot_timeout: 300
+        pre_reboot_delay: 0
+        post_reboot_delay: 30
+      when: reboot_required.stat.exists
+
+    - name: Wait for system to be ready
+      ansible.builtin.wait_for_connection:
+        delay: 10
+        timeout: 300
+      when: reboot_required.stat.exists
+
+    - name: Verify system is operational
+      ansible.builtin.command: uname -a
+      register: system_info
+      changed_when: false
+
+    - name: Display system info after patching
+      debug:
+        msg: "{{ system_info.stdout }}"
+
+  post_tasks:
+    - name: Check services after patching
+      shell: systemctl list-units --state=running --no-pager | grep -E '\.service' | wc -l
+      register: running_services_after
+      changed_when: false
+
+    - name: Log patching summary
+      copy:
+        content: |
+          Patching Summary - {{ ansible_date_time.iso8601 }}
+          ================================================
+          Host: {{ inventory_hostname }}
+          Tier: app
+          IP: {{ ansible_host }}
+
+          Packages Upgraded: {{ upgrade_result.changed }}
+          Reboot Required: {{ reboot_required.stat.exists }}
+          Running Services Before: {{ running_services.stdout }}
+          Running Services After: {{ running_services_after.stdout }}
+
+          System Information:
+          {{ system_info.stdout }}
+        dest: "/tmp/patch_{{ inventory_hostname }}_{{ ansible_date_time.iso8601_basic_short }}.txt"
+      delegate_to: localhost
+      become: false
+
+# ============================================================================
+# TEMPORARY: Open DB tier egress for patching
+# ============================================================================
+- name: Open DB Tier egress temporarily for patching
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - ../vars/security_groups_output.yml
+    - ../vars/output_vars.yml
+
+  tasks:
+    - name: Add temporary egress rules to DB tier SG
+      amazon.aws.ec2_group:
+        name: vprofile-db-tier-sg
+        description: "Database Tier - Restricted database servers (private subnets)"
+        vpc_id: "{{ vpc_id }}"
+        region: "{{ region }}"
+        purge_rules: false
+        purge_rules_egress: true
+        rules_egress:
+          - proto: udp
+            ports: [53]
+            cidr_ip: 0.0.0.0/0
+            rule_desc: "TEMP - DNS for patching"
+          - proto: tcp
+            ports: [443]
+            cidr_ip: 0.0.0.0/0
+            rule_desc: "TEMP - HTTPS for patching"
+          - proto: tcp
+            ports: [80]
+            cidr_ip: 0.0.0.0/0
+            rule_desc: "TEMP - HTTP for patching"
+        state: present
+
+    - name: Display temporary egress status
+      debug:
+        msg: "[OPEN] DB tier egress temporarily opened for patching"
+
+- name: Patch and Upgrade Database Tier
+  hosts: db_tier
+  serial: 10
+  become: true
+
+  pre_tasks:
+    - name: Check for running services before patching
+      shell: systemctl list-units --state=running --no-pager | grep -E '\.service' | wc -l
+      register: running_services
+      changed_when: false
+
+    - name: Display pre-patch service count
+      debug:
+        msg: "{{ inventory_hostname }} has {{ running_services.stdout }} running services"
+
+  tasks:
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Upgrade all packages (dist-upgrade)
+      ansible.builtin.apt:
+        upgrade: dist
+        autoremove: yes
+        autoclean: yes
+      register: upgrade_result
+
+    - name: Display upgraded packages
+      debug:
+        msg: "Upgraded packages on {{ inventory_hostname }}"
+      when: upgrade_result.changed
+
+    - name: Check if reboot is required
+      stat:
+        path: /var/run/reboot-required
+      register: reboot_required
+
+    - name: Reboot system if kernel was updated
+      ansible.builtin.reboot:
+        msg: "Reboot initiated by Ansible patching playbook"
+        connect_timeout: 5
+        reboot_timeout: 300
+        pre_reboot_delay: 0
+        post_reboot_delay: 30
+      when: reboot_required.stat.exists
+
+    - name: Wait for system to be ready
+      ansible.builtin.wait_for_connection:
+        delay: 10
+        timeout: 300
+      when: reboot_required.stat.exists
+
+    - name: Verify system is operational
+      ansible.builtin.command: uname -a
+      register: system_info
+      changed_when: false
+
+    - name: Display system info after patching
+      debug:
+        msg: "{{ system_info.stdout }}"
+
+  post_tasks:
+    - name: Check services after patching
+      shell: systemctl list-units --state=running --no-pager | grep -E '\.service' | wc -l
+      register: running_services_after
+      changed_when: false
+
+    - name: Log patching summary
+      copy:
+        content: |
+          Patching Summary - {{ ansible_date_time.iso8601 }}
+          ================================================
+          Host: {{ inventory_hostname }}
+          Tier: db
+          IP: {{ ansible_host }}
+
+          Packages Upgraded: {{ upgrade_result.changed }}
+          Reboot Required: {{ reboot_required.stat.exists }}
+          Running Services Before: {{ running_services.stdout }}
+          Running Services After: {{ running_services_after.stdout }}
+
+          System Information:
+          {{ system_info.stdout }}
+        dest: "/tmp/patch_{{ inventory_hostname }}_{{ ansible_date_time.iso8601_basic_short }}.txt"
+      delegate_to: localhost
+      become: false
+
+# ============================================================================
+# LOCK DOWN: Remove DB tier egress after patching
+# ============================================================================
+- name: Lock down DB Tier egress after patching
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - ../vars/security_groups_output.yml
+    - ../vars/output_vars.yml
+
+  tasks:
+    - name: Remove temporary egress rules from DB tier SG
+      amazon.aws.ec2_group:
+        name: vprofile-db-tier-sg
+        description: "Database Tier - Restricted database servers (private subnets, no outbound)"
+        vpc_id: "{{ vpc_id }}"
+        region: "{{ region }}"
+        purge_rules: false
+        purge_rules_egress: true
+        rules_egress: []
+        state: present
+
+    - name: Display lockdown status
+      debug:
+        msg: "[LOCKED] DB tier egress locked down - no outbound traffic allowed"
