@@ -1,0 +1,129 @@
+---
+- name: Install Additional Software on App Tier
+  hosts: app_tier
+  serial: 10
+  become: true
+
+  vars_files:
+    - ../vars/additional_packages.yml
+
+  tasks:
+    # ========================================================================
+    # JENKINS
+    # ========================================================================
+    - name: Install Jenkins
+      when: jenkins_enabled | default(false)
+      block:
+        - name: Ensure Java 17 is installed (Jenkins requirement)
+          ansible.builtin.apt:
+            name: "{{ jenkins_java_package }}"
+            state: present
+            update_cache: yes
+
+        - name: Add Jenkins GPG key
+          ansible.builtin.apt_key:
+            url: https://pkg.jenkins.io/debian-stable/jenkins.io-2023.key
+            state: present
+
+        - name: Add Jenkins repository
+          ansible.builtin.apt_repository:
+            repo: "deb https://pkg.jenkins.io/debian-stable binary/"
+            state: present
+            filename: jenkins
+            update_cache: yes
+
+        - name: Install Jenkins
+          ansible.builtin.apt:
+            name: jenkins
+            state: present
+
+        - name: Start and enable Jenkins service
+          ansible.builtin.systemd:
+            name: jenkins
+            state: started
+            enabled: yes
+
+        - name: Wait for Jenkins to start
+          ansible.builtin.wait_for:
+            port: "{{ jenkins_port }}"
+            delay: 10
+            timeout: 120
+
+        - name: Get Jenkins initial admin password
+          ansible.builtin.command: cat /var/lib/jenkins/secrets/initialAdminPassword
+          register: jenkins_password
+          changed_when: false
+
+        - name: Display Jenkins info
+          ansible.builtin.debug:
+            msg: |
+              Jenkins installed on {{ inventory_hostname }}
+              URL: http://{{ ansible_host }}:{{ jenkins_port }}
+              Initial Admin Password: {{ jenkins_password.stdout }}
+
+    # ========================================================================
+    # DOCKER (ensure running)
+    # ========================================================================
+    - name: Ensure Docker is installed and running
+      when: docker_enabled | default(false)
+      block:
+        - name: Check if Docker is installed
+          ansible.builtin.command: docker --version
+          register: docker_check
+          changed_when: false
+          ignore_errors: true
+
+        - name: Install Docker if not present
+          when: docker_check.rc != 0
+          block:
+            - name: Add Docker GPG key
+              ansible.builtin.apt_key:
+                url: https://download.docker.com/linux/ubuntu/gpg
+                state: present
+
+            - name: Add Docker repository
+              ansible.builtin.apt_repository:
+                repo: "deb https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+                state: present
+                update_cache: yes
+
+            - name: Install Docker packages
+              ansible.builtin.apt:
+                name:
+                  - docker-ce
+                  - docker-ce-cli
+                  - containerd.io
+                  - docker-compose-plugin
+                  - docker-buildx-plugin
+                state: present
+
+        - name: Start and enable Docker service
+          ansible.builtin.systemd:
+            name: docker
+            state: started
+            enabled: yes
+
+        - name: Add user to docker group
+          ansible.builtin.user:
+            name: "{{ docker_user }}"
+            groups: docker
+            append: yes
+
+        - name: Verify Docker
+          ansible.builtin.command: docker --version
+          register: docker_version
+          changed_when: false
+
+        - name: Display Docker info
+          ansible.builtin.debug:
+            msg: "Docker: {{ docker_version.stdout }} on {{ inventory_hostname }}"
+
+    # ========================================================================
+    # SUMMARY
+    # ========================================================================
+    - name: Installation summary
+      ansible.builtin.debug:
+        msg: |
+          Additional software installed on {{ inventory_hostname }}
+          Jenkins: {{ 'YES (port ' + jenkins_port|string + ')' if jenkins_enabled | default(false) else 'SKIPPED' }}
+          Docker:  {{ 'YES' if docker_enabled | default(false) else 'SKIPPED' }}

@@ -1,0 +1,36 @@
+---
+# Additional Software Installation Configuration
+# Edit this file to add software to any tier, then run:
+#   ansible-playbook playbooks/install_additional.yml
+#
+# To install on a specific tier only:
+#   ansible-playbook playbooks/install_additional.yml --limit app_tier
+
+# ============================================================================
+# APP TIER - Additional Software
+# ============================================================================
+
+# Jenkins
+jenkins_enabled: true
+jenkins_port: 8080
+jenkins_java_package: openjdk-17-jdk
+
+# Docker (already installed via package_install.yml, this ensures it's present)
+docker_enabled: true
+docker_user: ubuntu
+
+# ============================================================================
+# Add more software below as needed
+# ============================================================================
+
+# Example: Nginx reverse proxy for Jenkins
+# nginx_proxy_enabled: false
+# nginx_proxy_port: 80
+# nginx_proxy_target: "http://localhost:8080"
+
+# Example: Prometheus Node Exporter
+# node_exporter_enabled: false
+# node_exporter_version: "1.7.0"
+
+# Example: Grafana
+# grafana_enabled: false
