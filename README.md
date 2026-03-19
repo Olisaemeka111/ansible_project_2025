@@ -143,6 +143,8 @@ vprofile-db-01 through vprofile-db-10
 | **Phase 3** | Verify SSH connectivity to all 30 instances |
 | **Phase 4** | Install tier-specific packages |
 | **Phase 5** | Apply OS patches |
+| **Phase 6** | Install Jenkins + Docker on app tier |
+| **Phase 7** | Install monitoring stack (Prometheus, Grafana, Node Exporter) |
 | 13. Create ALB | Application Load Balancer for web tier |
 | 14. Display EC2 inventory | Show all 30 instances with IPs |
 | 15. Deployment summary | Final report |

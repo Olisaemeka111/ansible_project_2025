@@ -18,7 +18,9 @@ No manual Ansible execution is needed. The workflow handles everything:
 5. Provisions 30 servers (10 web + 10 app + 10 db)
 6. Installs tier-specific packages
 7. Applies OS patches
-8. Creates Application Load Balancer
+8. Installs Jenkins + Docker on app tier
+9. Installs monitoring stack (Prometheus, Grafana, Node Exporter, Alertmanager, cAdvisor)
+10. Creates Application Load Balancer
 
 ## Directory Structure
 
@@ -36,6 +38,7 @@ server-management/
 │   ├── servers.yml              # 30 server definitions
 │   ├── packages.yml             # Tier-specific package lists
 │   ├── security_groups.yml      # SG rule definitions
+│   ├── additional_packages.yml  # Jenkins, Docker, monitoring config
 │   ├── output_vars.yml          # VPC/subnet IDs (auto-generated)
 │   ├── security_groups_output.yml  # SG IDs (auto-generated)
 │   └── servers_output.yml       # Server details (auto-generated)
@@ -44,6 +47,8 @@ server-management/
 │   ├── provision_servers.yml    # Provision 30 EC2 instances
 │   ├── package_install.yml      # Install tier-specific packages
 │   ├── patching.yml             # Apply OS patches (all tiers)
+│   ├── install_additional.yml   # Install Jenkins + Docker on app tier
+│   ├── install_monitoring.yml   # Install Prometheus, Grafana, Node Exporter
 │   └── monitoring_and_cost.yml  # Resource monitoring + cost report
 ├── scripts/
 │   └── resource_monitor.sh      # System metrics collector (JSON)
@@ -64,9 +69,19 @@ Internet → ALB → [Web Tier] → [App Tier] → [DB Tier]
 
 | Tier | Servers | Subnets | Packages | Ports |
 |------|---------|---------|----------|-------|
-| **Web** | vprofile-web-01 to -10 | Public (172.20.1-3.0/24) | nginx, certbot, fail2ban, php-fpm | 80, 443 |
-| **App** | vprofile-app-01 to -10 | Private (172.20.4-6.0/24) | Java 17, Python 3, Node.js 20, Docker | 8000-9000 |
-| **DB** | vprofile-db-01 to -10 | Private (172.20.4-6.0/24) | mysql-client, postgresql-client, redis-tools | 3306, 5432, 27017, 6379 |
+| **Web** | vprofile-web-01 to -10 | Public (172.20.1-3.0/24) | nginx, certbot, fail2ban, php-fpm, Node Exporter | 80, 443, 9100 |
+| **App** | vprofile-app-01 to -10 | Private (172.20.4-6.0/24) | Java 17, Python 3, Node.js 20, Docker, Jenkins, Node Exporter, cAdvisor | 8000-9000, 8080, 9100, 8081 |
+| **DB** | vprofile-db-01 to -10 | Private (172.20.4-6.0/24) | mysql-client, postgresql-client, redis-tools, Node Exporter | 3306, 5432, 27017, 6379, 9100 |
+
+### Monitoring Stack (on app-01)
+
+| Service | Port | Purpose |
+|---------|------|---------|
+| **Prometheus** | 9090 | Metrics collection and storage (30d retention) |
+| **Grafana** | 3000 | Dashboards and visualization |
+| **Alertmanager** | 9093 | Alert routing and notification |
+| **Node Exporter** | 9100 | System metrics (all 30 servers) |
+| **cAdvisor** | 8081 | Docker container metrics (app tier) |
 
 ## Security Groups
 
@@ -92,6 +107,19 @@ Installs tier-specific packages. DB tier is wrapped with temporary egress open/c
 ### patching.yml
 Applies `apt dist-upgrade` to all tiers. Reboots if kernel updated. DB tier wrapped with temporary egress.
 
+### install_additional.yml
+Installs Jenkins CI/CD and ensures Docker is running on the app tier. Configurable via `vars/additional_packages.yml`.
+
+### install_monitoring.yml
+Installs the full monitoring stack:
+- **Node Exporter** on all 30 servers (CPU, memory, disk, network metrics)
+- **Prometheus Server** on app-01 (scrapes all 30 Node Exporters + cAdvisor)
+- **Grafana** on app-01 (auto-configured with Prometheus datasource)
+- **Alertmanager** on app-01 (alert routing)
+- **cAdvisor** on app tier (Docker container metrics)
+
+Configurable via `vars/additional_packages.yml` — toggle any component on/off.
+
 ### monitoring_and_cost.yml
 Collects CPU/memory/disk/network metrics and generates HTML cost report.
 
@@ -116,6 +144,8 @@ ansible-playbook playbooks/security_groups.yml
 ansible-playbook playbooks/provision_servers.yml
 ansible-playbook playbooks/package_install.yml
 ansible-playbook playbooks/patching.yml
+ansible-playbook playbooks/install_additional.yml
+ansible-playbook playbooks/install_monitoring.yml
 ```
 
 ### Test connectivity

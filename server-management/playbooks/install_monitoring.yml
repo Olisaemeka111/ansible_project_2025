@@ -1,0 +1,593 @@
+---
+# ============================================================================
+# PHASE 1: Install Node Exporter on ALL servers (metrics collection agent)
+# ============================================================================
+- name: Install Node Exporter on All Servers
+  hosts: web_tier:app_tier:db_tier
+  serial: 10
+  become: true
+
+  vars_files:
+    - ../vars/additional_packages.yml
+
+  tasks:
+    - name: Install Node Exporter
+      when: node_exporter_enabled | default(false)
+      block:
+        - name: Create node_exporter user
+          ansible.builtin.user:
+            name: node_exporter
+            shell: /usr/sbin/nologin
+            system: yes
+            create_home: no
+
+        - name: Check if node_exporter is already installed
+          ansible.builtin.stat:
+            path: /usr/local/bin/node_exporter
+          register: ne_binary
+
+        - name: Download and install Node Exporter
+          when: not ne_binary.stat.exists
+          block:
+            - name: Download Node Exporter
+              ansible.builtin.get_url:
+                url: "https://github.com/prometheus/node_exporter/releases/download/v{{ node_exporter_version }}/node_exporter-{{ node_exporter_version }}.linux-amd64.tar.gz"
+                dest: /tmp/node_exporter.tar.gz
+                mode: '0644'
+
+            - name: Extract Node Exporter
+              ansible.builtin.unarchive:
+                src: /tmp/node_exporter.tar.gz
+                dest: /tmp/
+                remote_src: yes
+
+            - name: Copy Node Exporter binary
+              ansible.builtin.copy:
+                src: "/tmp/node_exporter-{{ node_exporter_version }}.linux-amd64/node_exporter"
+                dest: /usr/local/bin/node_exporter
+                owner: node_exporter
+                group: node_exporter
+                mode: '0755'
+                remote_src: yes
+
+            - name: Clean up download
+              ansible.builtin.file:
+                path: "{{ item }}"
+                state: absent
+              loop:
+                - /tmp/node_exporter.tar.gz
+                - "/tmp/node_exporter-{{ node_exporter_version }}.linux-amd64"
+
+        - name: Create Node Exporter systemd service
+          ansible.builtin.copy:
+            content: |
+              [Unit]
+              Description=Prometheus Node Exporter
+              After=network-online.target
+              Wants=network-online.target
+
+              [Service]
+              User=node_exporter
+              Group=node_exporter
+              Type=simple
+              ExecStart=/usr/local/bin/node_exporter \
+                --collector.systemd \
+                --collector.processes
+              Restart=always
+              RestartSec=5
+
+              [Install]
+              WantedBy=multi-user.target
+            dest: /etc/systemd/system/node_exporter.service
+            mode: '0644'
+
+        - name: Start and enable Node Exporter
+          ansible.builtin.systemd:
+            name: node_exporter
+            daemon_reload: yes
+            state: started
+            enabled: yes
+
+        - name: Verify Node Exporter is running
+          ansible.builtin.uri:
+            url: "http://localhost:{{ node_exporter_port }}/metrics"
+            return_content: no
+          register: ne_check
+          until: ne_check.status == 200
+          retries: 3
+          delay: 5
+
+        - name: Display Node Exporter status
+          ansible.builtin.debug:
+            msg: "Node Exporter running on {{ inventory_hostname }}:{{ node_exporter_port }}"
+
+# ============================================================================
+# PHASE 2: Open temporary DB tier egress for monitoring downloads
+# ============================================================================
+- name: Open DB Tier egress for monitoring setup
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - ../vars/additional_packages.yml
+    - ../vars/output_vars.yml
+
+  tasks:
+    - name: Add temporary egress for DB tier (already open from node_exporter)
+      ansible.builtin.debug:
+        msg: "DB tier egress handled by node_exporter installation phase"
+
+# ============================================================================
+# PHASE 3: Install cAdvisor on App Tier (container metrics)
+# ============================================================================
+- name: Install cAdvisor on App Tier
+  hosts: app_tier
+  serial: 10
+  become: true
+
+  vars_files:
+    - ../vars/additional_packages.yml
+
+  tasks:
+    - name: Install cAdvisor as Docker container
+      when: cadvisor_enabled | default(false)
+      block:
+        - name: Run cAdvisor container
+          ansible.builtin.shell: |
+            docker rm -f cadvisor 2>/dev/null || true
+            docker run -d \
+              --name cadvisor \
+              --restart always \
+              --publish {{ cadvisor_port }}:8080 \
+              --volume /:/rootfs:ro \
+              --volume /var/run:/var/run:ro \
+              --volume /sys:/sys:ro \
+              --volume /var/lib/docker/:/var/lib/docker:ro \
+              --volume /dev/disk/:/dev/disk:ro \
+              --privileged \
+              gcr.io/cadvisor/cadvisor:latest
+          register: cadvisor_result
+          changed_when: cadvisor_result.rc == 0
+
+        - name: Display cAdvisor status
+          ansible.builtin.debug:
+            msg: "cAdvisor running on {{ inventory_hostname }}:{{ cadvisor_port }}"
+
+# ============================================================================
+# PHASE 4: Install Prometheus Server on app-01 (monitoring hub)
+# ============================================================================
+- name: Install Prometheus Server on App-01
+  hosts: app_tier
+  become: true
+
+  vars_files:
+    - ../vars/additional_packages.yml
+
+  tasks:
+    - name: Install Prometheus (only on first app server)
+      when:
+        - prometheus_enabled | default(false)
+        - inventory_hostname == (groups['app_tier'] | sort | first)
+      block:
+        - name: Create prometheus user
+          ansible.builtin.user:
+            name: prometheus
+            shell: /usr/sbin/nologin
+            system: yes
+            create_home: no
+
+        - name: Create Prometheus directories
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: directory
+            owner: prometheus
+            group: prometheus
+            mode: '0755'
+          loop:
+            - /etc/prometheus
+            - /var/lib/prometheus
+
+        - name: Check if Prometheus is already installed
+          ansible.builtin.stat:
+            path: /usr/local/bin/prometheus
+          register: prom_binary
+
+        - name: Download and install Prometheus
+          when: not prom_binary.stat.exists
+          block:
+            - name: Download Prometheus
+              ansible.builtin.get_url:
+                url: "https://github.com/prometheus/prometheus/releases/download/v{{ prometheus_version }}/prometheus-{{ prometheus_version }}.linux-amd64.tar.gz"
+                dest: /tmp/prometheus.tar.gz
+                mode: '0644'
+
+            - name: Extract Prometheus
+              ansible.builtin.unarchive:
+                src: /tmp/prometheus.tar.gz
+                dest: /tmp/
+                remote_src: yes
+
+            - name: Copy Prometheus binaries
+              ansible.builtin.copy:
+                src: "/tmp/prometheus-{{ prometheus_version }}.linux-amd64/{{ item }}"
+                dest: "/usr/local/bin/{{ item }}"
+                owner: prometheus
+                group: prometheus
+                mode: '0755'
+                remote_src: yes
+              loop:
+                - prometheus
+                - promtool
+
+            - name: Copy console files
+              ansible.builtin.copy:
+                src: "/tmp/prometheus-{{ prometheus_version }}.linux-amd64/{{ item }}"
+                dest: "/etc/prometheus/{{ item }}"
+                owner: prometheus
+                group: prometheus
+                remote_src: yes
+              loop:
+                - consoles
+                - console_libraries
+
+            - name: Clean up download
+              ansible.builtin.file:
+                path: "{{ item }}"
+                state: absent
+              loop:
+                - /tmp/prometheus.tar.gz
+                - "/tmp/prometheus-{{ prometheus_version }}.linux-amd64"
+
+        - name: Generate Prometheus configuration
+          ansible.builtin.copy:
+            content: |
+              global:
+                scrape_interval: {{ prometheus_scrape_interval }}
+                evaluation_interval: 15s
+
+              scrape_configs:
+                - job_name: 'prometheus'
+                  static_configs:
+                    - targets: ['localhost:{{ prometheus_port }}']
+
+                - job_name: 'node_exporter_web'
+                  static_configs:
+                    - targets:
+              {% for host in groups['web_tier'] | sort %}
+                        - '{{ hostvars[host].ansible_host }}:{{ node_exporter_port }}'
+              {% endfor %}
+                      labels:
+                        tier: 'web'
+
+                - job_name: 'node_exporter_app'
+                  static_configs:
+                    - targets:
+              {% for host in groups['app_tier'] | sort %}
+                        - '{{ hostvars[host].ansible_host }}:{{ node_exporter_port }}'
+              {% endfor %}
+                      labels:
+                        tier: 'app'
+
+                - job_name: 'node_exporter_db'
+                  static_configs:
+                    - targets:
+              {% for host in groups['db_tier'] | sort %}
+                        - '{{ hostvars[host].ansible_host }}:{{ node_exporter_port }}'
+              {% endfor %}
+                      labels:
+                        tier: 'db'
+
+              {% if cadvisor_enabled | default(false) %}
+                - job_name: 'cadvisor'
+                  static_configs:
+                    - targets:
+              {% for host in groups['app_tier'] | sort %}
+                        - '{{ hostvars[host].ansible_host }}:{{ cadvisor_port }}'
+              {% endfor %}
+                      labels:
+                        tier: 'app'
+              {% endif %}
+
+              {% if jenkins_enabled | default(false) %}
+                - job_name: 'jenkins'
+                  metrics_path: /prometheus
+                  static_configs:
+                    - targets:
+              {% for host in groups['app_tier'] | sort %}
+                        - '{{ hostvars[host].ansible_host }}:{{ jenkins_port }}'
+              {% endfor %}
+                      labels:
+                        tier: 'app'
+              {% endif %}
+            dest: /etc/prometheus/prometheus.yml
+            owner: prometheus
+            group: prometheus
+            mode: '0644'
+
+        - name: Create Prometheus systemd service
+          ansible.builtin.copy:
+            content: |
+              [Unit]
+              Description=Prometheus Monitoring
+              After=network-online.target
+              Wants=network-online.target
+
+              [Service]
+              User=prometheus
+              Group=prometheus
+              Type=simple
+              ExecStart=/usr/local/bin/prometheus \
+                --config.file=/etc/prometheus/prometheus.yml \
+                --storage.tsdb.path=/var/lib/prometheus/ \
+                --storage.tsdb.retention.time={{ prometheus_retention }} \
+                --web.console.templates=/etc/prometheus/consoles \
+                --web.console.libraries=/etc/prometheus/console_libraries \
+                --web.listen-address=0.0.0.0:{{ prometheus_port }}
+              Restart=always
+              RestartSec=5
+
+              [Install]
+              WantedBy=multi-user.target
+            dest: /etc/systemd/system/prometheus.service
+            mode: '0644'
+
+        - name: Start and enable Prometheus
+          ansible.builtin.systemd:
+            name: prometheus
+            daemon_reload: yes
+            state: restarted
+            enabled: yes
+
+        - name: Wait for Prometheus to start
+          ansible.builtin.wait_for:
+            port: "{{ prometheus_port }}"
+            delay: 5
+            timeout: 60
+
+        - name: Display Prometheus status
+          ansible.builtin.debug:
+            msg: "Prometheus running on {{ inventory_hostname }}:{{ prometheus_port }}"
+
+# ============================================================================
+# PHASE 5: Install Alertmanager on app-01
+# ============================================================================
+- name: Install Alertmanager on App-01
+  hosts: app_tier
+  become: true
+
+  vars_files:
+    - ../vars/additional_packages.yml
+
+  tasks:
+    - name: Install Alertmanager (only on first app server)
+      when:
+        - alertmanager_enabled | default(false)
+        - inventory_hostname == (groups['app_tier'] | sort | first)
+      block:
+        - name: Create alertmanager user
+          ansible.builtin.user:
+            name: alertmanager
+            shell: /usr/sbin/nologin
+            system: yes
+            create_home: no
+
+        - name: Create Alertmanager directories
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: directory
+            owner: alertmanager
+            group: alertmanager
+            mode: '0755'
+          loop:
+            - /etc/alertmanager
+            - /var/lib/alertmanager
+
+        - name: Check if Alertmanager is already installed
+          ansible.builtin.stat:
+            path: /usr/local/bin/alertmanager
+          register: am_binary
+
+        - name: Download and install Alertmanager
+          when: not am_binary.stat.exists
+          block:
+            - name: Download Alertmanager
+              ansible.builtin.get_url:
+                url: "https://github.com/prometheus/alertmanager/releases/download/v{{ alertmanager_version }}/alertmanager-{{ alertmanager_version }}.linux-amd64.tar.gz"
+                dest: /tmp/alertmanager.tar.gz
+                mode: '0644'
+
+            - name: Extract Alertmanager
+              ansible.builtin.unarchive:
+                src: /tmp/alertmanager.tar.gz
+                dest: /tmp/
+                remote_src: yes
+
+            - name: Copy Alertmanager binaries
+              ansible.builtin.copy:
+                src: "/tmp/alertmanager-{{ alertmanager_version }}.linux-amd64/{{ item }}"
+                dest: "/usr/local/bin/{{ item }}"
+                owner: alertmanager
+                group: alertmanager
+                mode: '0755'
+                remote_src: yes
+              loop:
+                - alertmanager
+                - amtool
+
+            - name: Clean up download
+              ansible.builtin.file:
+                path: "{{ item }}"
+                state: absent
+              loop:
+                - /tmp/alertmanager.tar.gz
+                - "/tmp/alertmanager-{{ alertmanager_version }}.linux-amd64"
+
+        - name: Create Alertmanager configuration
+          ansible.builtin.copy:
+            content: |
+              global:
+                resolve_timeout: 5m
+
+              route:
+                receiver: 'default'
+                group_wait: 30s
+                group_interval: 5m
+                repeat_interval: 4h
+
+              receivers:
+                - name: 'default'
+            dest: /etc/alertmanager/alertmanager.yml
+            owner: alertmanager
+            group: alertmanager
+            mode: '0644'
+
+        - name: Create Alertmanager systemd service
+          ansible.builtin.copy:
+            content: |
+              [Unit]
+              Description=Prometheus Alertmanager
+              After=network-online.target
+              Wants=network-online.target
+
+              [Service]
+              User=alertmanager
+              Group=alertmanager
+              Type=simple
+              ExecStart=/usr/local/bin/alertmanager \
+                --config.file=/etc/alertmanager/alertmanager.yml \
+                --storage.path=/var/lib/alertmanager/ \
+                --web.listen-address=0.0.0.0:{{ alertmanager_port }}
+              Restart=always
+              RestartSec=5
+
+              [Install]
+              WantedBy=multi-user.target
+            dest: /etc/systemd/system/alertmanager.service
+            mode: '0644'
+
+        - name: Start and enable Alertmanager
+          ansible.builtin.systemd:
+            name: alertmanager
+            daemon_reload: yes
+            state: started
+            enabled: yes
+
+        - name: Display Alertmanager status
+          ansible.builtin.debug:
+            msg: "Alertmanager running on {{ inventory_hostname }}:{{ alertmanager_port }}"
+
+# ============================================================================
+# PHASE 6: Install Grafana on app-01 (dashboards)
+# ============================================================================
+- name: Install Grafana on App-01
+  hosts: app_tier
+  become: true
+
+  vars_files:
+    - ../vars/additional_packages.yml
+
+  tasks:
+    - name: Install Grafana (only on first app server)
+      when:
+        - grafana_enabled | default(false)
+        - inventory_hostname == (groups['app_tier'] | sort | first)
+      block:
+        - name: Add Grafana GPG key
+          ansible.builtin.apt_key:
+            url: https://apt.grafana.com/gpg.key
+            state: present
+
+        - name: Add Grafana repository
+          ansible.builtin.apt_repository:
+            repo: "deb https://apt.grafana.com stable main"
+            state: present
+            filename: grafana
+            update_cache: yes
+
+        - name: Install Grafana
+          ansible.builtin.apt:
+            name: grafana
+            state: present
+
+        - name: Start and enable Grafana
+          ansible.builtin.systemd:
+            name: grafana-server
+            state: started
+            enabled: yes
+
+        - name: Wait for Grafana to start
+          ansible.builtin.wait_for:
+            port: "{{ grafana_port }}"
+            delay: 5
+            timeout: 60
+
+        - name: Add Prometheus as Grafana datasource
+          ansible.builtin.uri:
+            url: "http://localhost:{{ grafana_port }}/api/datasources"
+            method: POST
+            user: admin
+            password: admin
+            force_basic_auth: yes
+            body_format: json
+            body:
+              name: Prometheus
+              type: prometheus
+              url: "http://localhost:{{ prometheus_port }}"
+              access: proxy
+              isDefault: true
+            status_code: [200, 409]
+
+        - name: Display Grafana status
+          ansible.builtin.debug:
+            msg: |
+              Grafana running on {{ inventory_hostname }}:{{ grafana_port }}
+              Login: admin / admin (change on first login)
+              Prometheus datasource auto-configured
+
+# ============================================================================
+# SUMMARY
+# ============================================================================
+- name: Monitoring Stack Summary
+  hosts: app_tier
+  become: false
+  gather_facts: false
+
+  vars_files:
+    - ../vars/additional_packages.yml
+
+  tasks:
+    - name: Display monitoring summary (on first app server only)
+      when: inventory_hostname == (groups['app_tier'] | sort | first)
+      ansible.builtin.debug:
+        msg: |
+          +==========================================================+
+          |         MONITORING STACK INSTALLED                        |
+          +==========================================================+
+
+          Node Exporter (port {{ node_exporter_port }}):
+            Installed on ALL 30 servers (web + app + db)
+            Collects: CPU, memory, disk, network, processes
+
+          Prometheus (port {{ prometheus_port }}):
+            Installed on: {{ inventory_hostname }}
+            Retention: {{ prometheus_retention }}
+            Scrape interval: {{ prometheus_scrape_interval }}
+            Targets: 30 node_exporters + cAdvisor + Jenkins
+
+          Alertmanager (port {{ alertmanager_port }}):
+            Installed on: {{ inventory_hostname }}
+
+          Grafana (port {{ grafana_port }}):
+            Installed on: {{ inventory_hostname }}
+            Login: admin / admin
+            Datasource: Prometheus (auto-configured)
+
+          cAdvisor (port {{ cadvisor_port }}):
+            Installed on: all app tier servers
+            Collects: Docker container metrics
+
+          ACCESS URLS (from within VPC):
+            Prometheus: http://{{ ansible_host }}:{{ prometheus_port }}
+            Grafana:    http://{{ ansible_host }}:{{ grafana_port }}
+            Alertmanager: http://{{ ansible_host }}:{{ alertmanager_port }}

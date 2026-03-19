@@ -1,36 +1,49 @@
 ---
 # Additional Software Installation Configuration
-# Edit this file to add software to any tier, then run:
+# Edit this file to enable/disable software, then push to main.
+# Or run manually from control node:
 #   ansible-playbook playbooks/install_additional.yml
-#
-# To install on a specific tier only:
-#   ansible-playbook playbooks/install_additional.yml --limit app_tier
+#   ansible-playbook playbooks/install_monitoring.yml
 
 # ============================================================================
-# APP TIER - Additional Software
+# APP TIER - Application Software
 # ============================================================================
 
-# Jenkins
+# Jenkins CI/CD
 jenkins_enabled: true
 jenkins_port: 8080
 jenkins_java_package: openjdk-17-jdk
 
-# Docker (already installed via package_install.yml, this ensures it's present)
+# Docker (already installed via package_install.yml, ensures it's present)
 docker_enabled: true
 docker_user: ubuntu
 
 # ============================================================================
-# Add more software below as needed
+# MONITORING STACK (All Tiers)
 # ============================================================================
 
-# Example: Nginx reverse proxy for Jenkins
-# nginx_proxy_enabled: false
-# nginx_proxy_port: 80
-# nginx_proxy_target: "http://localhost:8080"
+# Prometheus Node Exporter - installed on ALL servers (web, app, db)
+# Collects CPU, memory, disk, network metrics
+node_exporter_enabled: true
+node_exporter_version: "1.8.2"
+node_exporter_port: 9100
 
-# Example: Prometheus Node Exporter
-# node_exporter_enabled: false
-# node_exporter_version: "1.7.0"
+# Prometheus Server - installed on app-01 only (monitoring hub)
+prometheus_enabled: true
+prometheus_version: "2.53.0"
+prometheus_port: 9090
+prometheus_retention: "30d"
+prometheus_scrape_interval: "15s"
 
-# Example: Grafana
-# grafana_enabled: false
+# Grafana - installed on app-01 only (dashboards)
+grafana_enabled: true
+grafana_port: 3000
+
+# Alertmanager - installed on app-01 alongside Prometheus
+alertmanager_enabled: true
+alertmanager_version: "0.27.0"
+alertmanager_port: 9093
+
+# cAdvisor - container metrics on app tier (where Docker runs)
+cadvisor_enabled: true
+cadvisor_port: 8081
