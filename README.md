@@ -1,188 +1,269 @@
-Here is a well-structured **README.md** file for your Ansible project. It provides detailed information about the project, its purpose, prerequisites, and instructions for running the playbook.
+# 3-Tier AWS Infrastructure with Ansible & GitHub Actions
+
+## Project Overview
+
+Fully automated deployment of a **30-server, 3-tier architecture** on AWS using Ansible for configuration management and GitHub Actions for CI/CD orchestration. Everything is created from scratch — no pre-existing infrastructure required.
+
+**Repository:** https://github.com/Olisaemeka111/ansible_project_2025.git
 
 ---
 
-# **Ansible Project: Provisioning AWS EC2 Instances**
+## What Was Built
 
-## **Project Overview**
-This Ansible project automates the provisioning of AWS infrastructure, including setting up a Virtual Private Cloud (VPC), Subnets, Security Groups, and EC2 instances, to deploy and manage resources efficiently in the AWS cloud. The playbook uses the `amazon.aws` collection for AWS resource management.
+### Infrastructure Created (Automated via GitHub Actions)
 
-**Key Features:**
-- Creates a VPC and public subnet.
-- Configures an Internet Gateway and Route Table.
-- Creates a Security Group with custom rules.
-- Launches EC2 instances in a specified AWS region.
-- Dynamically adds created EC2 instances to the `ec2_hosts` Ansible group.
+| Resource | Details |
+|----------|---------|
+| **VPC** | `172.20.0.0/16` in `us-east-2` |
+| **Subnets** | 6 total — 3 public (`172.20.1-3.0/24`) + 3 private (`172.20.4-6.0/24`) |
+| **Internet Gateway** | Attached to VPC for public subnet internet access |
+| **NAT Gateway** | In public subnet for private subnet outbound access |
+| **Route Tables** | Public (IGW) + Private (NAT GW) |
+| **SSH Key Pair** | `vprofile-key` — created once, reused across runs via S3 |
+| **Control Node** | EC2 instance with Ansible bootstrapped via AWS SSM |
+| **Security Groups** | 3 tier-specific SGs with least-privilege rules |
+| **EC2 Instances** | 30 servers (10 web + 10 app + 10 db) across 3 AZs |
+| **Application Load Balancer** | Routes HTTP traffic to web tier |
+| **S3 Bucket** | Code distribution and SSH key storage |
+
+### Server Inventory (30 Instances)
+
+**Web Tier** (10 servers in public subnets):
+```
+vprofile-web-01  172.20.1.86   18.191.235.250  us-east-2a
+vprofile-web-02  172.20.2.238  18.191.177.217  us-east-2b
+vprofile-web-03  172.20.3.166  3.19.245.158    us-east-2c
+vprofile-web-04  172.20.1.205  3.149.255.14    us-east-2a
+vprofile-web-05  172.20.2.227  18.223.99.253   us-east-2b
+vprofile-web-06  172.20.3.50   18.217.101.46   us-east-2c
+vprofile-web-07  172.20.1.200  18.188.238.72   us-east-2a
+vprofile-web-08  172.20.2.209  3.16.136.214    us-east-2b
+vprofile-web-09  172.20.3.34   52.14.163.155   us-east-2c
+vprofile-web-10  172.20.1.24   3.135.193.92    us-east-2a
+```
+
+**App Tier** (10 servers in private subnets):
+```
+vprofile-app-01 through vprofile-app-10
+172.20.4.x / 172.20.5.x / 172.20.6.x (private only)
+```
+
+**Database Tier** (10 servers in private subnets):
+```
+vprofile-db-01 through vprofile-db-10
+172.20.4.x / 172.20.5.x / 172.20.6.x (private only, no outbound)
+```
+
+**ALB DNS:** `vprofile-web-alb-908000172.us-east-2.elb.amazonaws.com`
 
 ---
 
-## **Folder Structure**
+## Architecture
 
 ```
-├── playbook.yml              # Main Ansible playbook.
-├── ec2_2_vars.yml            # Variables file (contains user-defined values like region, instance type, etc.).
-├── README.md                 # Documentation about the project.
-├── requirements.yml          # Ansible collections required (e.g., amazon.aws).
-```
-
----
-
-## **Prerequisites**
-
-### **1. AWS Account**
-Ensure you have an AWS account with adequate permissions for EC2, VPC, and IAM operations.
-
-### **2. AWS Access Keys**
-You need AWS Access Key ID and Secret Access Key to authenticate with AWS. Keep these credentials secure.
-
-### **3. Install Ansible**
-Install Ansible on your local machine:
-```shell script
-pip install ansible
-```
-
-### **4. Ansible AWS Collection**
-Install the `amazon.aws` collection for managing AWS resources:
-```shell script
-ansible-galaxy collection install amazon.aws
-```
-
-### **5. Configure AWS CLI (Optional)**
-It's recommended to set up AWS CLI for seamless integration:
-```shell script
-aws configure
-```
-
-### **6. Python and Dependencies**
-Install Python `boto3` and `botocore` libraries for Ansible AWS modules:
-```shell script
-pip install boto3 botocore
-```
-
----
-
-## **Variable Definitions**
-
-The `ec2_2_vars.yml` file contains customizable variables. Below is an example:
-
-```yaml
-vpc_name: my_vpc               # Name of the VPC
-vpc_cidr: 10.0.0.0/16          # CIDR block for the VPC
-subnet_cidr: 10.0.1.0/24       # CIDR block for the subnet
-aws_region: us-east-1          # AWS region
-ami_id: ami-0123456789abcdef0  # AMI ID to use for EC2 instances
-instance_type: t2.micro        # Instance type
-key_name: my-key-pair          # Name of the SSH key pair
-security_group: web-sg         # Security group name
-```
-
-Update these variables as per your AWS environment and requirements.
-
----
-
-## **How to Run**
-
-### **1. Clone the Repository**
-Clone the repository to your local machine:
-```shell script
-git clone <repository-url>
-cd <repository-folder>
-```
-
-### **2. Update Variable File**
-Edit `ec2_2_vars.yml` and provide the relevant values (e.g., VPC name, region, AMI ID, etc.).
-
-### **3. Run the Playbook**
-Execute the playbook using the `ansible-playbook` command:
-```shell script
-ansible-playbook playbook.yml -e @ec2_2_vars.yml
-```
-
-### **4. Debugging (Optional)**
-Enable verbose logging by adding the `-vvv` flag:
-```shell script
-ansible-playbook playbook.yml -e @ec2_2_vars.yml -vvv
+                        INTERNET
+                           |
+                    [ ALB (HTTP/HTTPS) ]
+                           |
+              +------------+------------+
+              |            |            |
+         us-east-2a   us-east-2b   us-east-2c
+              |            |            |
+    +---------+--+---------+--+---------+--+
+    | PUBLIC SUBNETS (172.20.1-3.0/24)     |
+    | [Web Tier] 10 servers                |
+    | nginx, certbot, fail2ban, php-fpm    |
+    | Inbound: 80, 443, 22                 |
+    | Outbound: App Tier (8000-9000)       |
+    +--------------------------------------+
+              |
+              | ports 8000-9000
+              |
+    +--------------------------------------+
+    | PRIVATE SUBNETS (172.20.4-6.0/24)    |
+    | [App Tier] 10 servers                |
+    | Java 17, Python 3, Node.js 20,       |
+    | Docker CE, build tools               |
+    | Inbound: 8000-9000 from Web SG       |
+    | Outbound: DB Tier (3306,5432,27017,  |
+    |           6379) + DNS + HTTPS        |
+    +--------------------------------------+
+              |
+              | DB ports only
+              |
+    +--------------------------------------+
+    | PRIVATE SUBNETS (172.20.4-6.0/24)    |
+    | [DB Tier] 10 servers                 |
+    | mysql-client, postgresql-client,      |
+    | redis-tools, sqlite3, collectd       |
+    | Inbound: 3306, 5432, 27017, 6379     |
+    |          from App SG only            |
+    | Outbound: DENY ALL                   |
+    +--------------------------------------+
 ```
 
 ---
 
-## **What the Playbook Does**
+## Security Groups
 
-1. **Creates a VPC**:
-   - A new VPC with the specified name and CIDR block.
+| Security Group | Inbound | Outbound |
+|----------------|---------|----------|
+| **vprofile-web-tier-sg** | HTTP (80), HTTPS (443) from `0.0.0.0/0`; SSH (22) from VPC CIDR | App Tier (8000-9000), DNS (53), HTTPS (443), HTTP (80) |
+| **vprofile-app-tier-sg** | Ports 8000-9000 from Web SG; SSH (22) from VPC CIDR | DB Tier (3306, 5432, 27017, 6379), DNS (53), HTTPS (443), HTTP (80) |
+| **vprofile-db-tier-sg** | MySQL (3306), PostgreSQL (5432), MongoDB (27017), Redis (6379) from App SG; SSH (22) from VPC CIDR | **DENY ALL** (no outbound traffic) |
 
-2. **Creates Network Resources**:
-   - Public Subnet, Internet Gateway, and Route Table with proper associations.
-
-3. **Security Group Configuration**:
-   - Opens specified ports (e.g., SSH, HTTP, HTTPS).
-
-4. **Launches EC2 Instances**:
-   - Deploys EC2 instances within the configured VPC and subnet.
-
-5. **Adds Hosts to Inventory**:
-   - Dynamically adds public IP addresses of the instances to the `ec2_hosts` group.
+> DB tier egress is temporarily opened for package installation and patching, then immediately locked down.
 
 ---
 
-## **Outputs**
+## GitHub Actions Workflow
 
-- Public IP addresses and instance IDs of the created EC2 instances will be displayed and stored dynamically in the instance variable.
-- Example output:
-```shell script
-TASK [debug] 
-  ok: [localhost] => (item=0) => {
-      "msg": "Created instance with ID: i-0a12b345c67d89e01, Public IP: 34.238.152.72, Name: webapp-instance-1"
-  }
+### Triggers
+- **Push to `main`** — deploys automatically
+- **Manual dispatch** — choose `deploy` or `cleanup`
+
+### Deployment Steps (Visible in GitHub Actions UI)
+
+| Step | Description |
+|------|-------------|
+| 1. Create VPC | VPC with CIDR `172.20.0.0/16` |
+| 2. Create subnets | 3 public + 3 private across 3 AZs |
+| 3. Create Internet Gateway | Attach IGW to VPC |
+| 4. Create NAT Gateway | For private subnet outbound access |
+| 5. Create route tables | Public (IGW) + Private (NAT) |
+| 6. Create/reuse SSH key pair | Idempotent — checks AWS + S3 before creating |
+| 7. Generate vars files | Update Ansible vars with new VPC/subnet IDs |
+| 8. Upload code to S3 | Distribute code to control node |
+| 9. Launch control node | EC2 with SSM agent for remote execution |
+| 10. Bootstrap control node | Install Ansible, AWS CLI, collections |
+| 11. Deploy SSH key | Copy key from S3 to control node |
+| 12. Sync code | Copy playbooks to control node |
+| **Phase 1** | Create 3 security groups |
+| **Phase 2** | Provision 30 servers (10 per tier) |
+| **Phase 3** | Verify SSH connectivity to all 30 instances |
+| **Phase 4** | Install tier-specific packages |
+| **Phase 5** | Apply OS patches |
+| 13. Create ALB | Application Load Balancer for web tier |
+| 14. Display EC2 inventory | Show all 30 instances with IPs |
+| 15. Deployment summary | Final report |
+
+### Cleanup (Manual Dispatch)
+Destroys **everything** in reverse order: ALB, instances, security groups, NAT GW, IGW, subnets, route tables, VPC, SSH key pair.
+
+---
+
+## Packages Installed Per Tier
+
+### Web Tier
+- nginx, certbot, python3-certbot-nginx, fail2ban, ufw, php-fpm, php-mysql
+- Common: curl, wget, git, htop, jq, awscli, vim, nano, net-tools
+
+### App Tier
+- **Java 17**: openjdk-17-jdk/jre/headless
+- **Python 3**: python3, pip3, venv, dev tools + pip packages (boto3, botocore, requests, python-dotenv)
+- **Node.js 20**: via NodeSource repository
+- **Docker CE**: docker-ce, docker-compose-plugin, docker-buildx-plugin, containerd.io
+- Build tools: build-essential, libssl-dev, libffi-dev
+
+### Database Tier
+- mysql-client, postgresql-client, redis-tools, sqlite3
+- Monitoring: collectd
+
+---
+
+## Directory Structure
+
+```
+Ansible-infrastructure/
+├── .github/workflows/
+│   └── deploy-infrastructure.yml    # Main CI/CD workflow (deploy + cleanup)
+├── server-management/
+│   ├── ansible.cfg                  # Ansible configuration
+│   ├── inventory/
+│   │   ├── aws_ec2.yml              # Dynamic inventory (aws_ec2 plugin)
+│   │   └── group_vars/
+│   │       ├── all.yml              # Shared variables
+│   │       ├── web_tier.yml         # Web tier config
+│   │       ├── app_tier.yml         # App tier config
+│   │       └── db_tier.yml          # DB tier config
+│   ├── vars/
+│   │   ├── servers.yml              # 30 server definitions
+│   │   ├── packages.yml             # Tier-specific package lists
+│   │   ├── security_groups.yml      # SG rule definitions
+│   │   ├── output_vars.yml          # VPC/subnet IDs
+│   │   ├── security_groups_output.yml  # Generated SG IDs
+│   │   └── servers_output.yml       # Generated server details
+│   ├── playbooks/
+│   │   ├── security_groups.yml      # Create 3 security groups
+│   │   ├── provision_servers.yml    # Provision 30 EC2 instances
+│   │   ├── package_install.yml      # Install tier-specific packages
+│   │   ├── patching.yml             # Apply OS patches (all tiers)
+│   │   └── monitoring_and_cost.yml  # Resource monitoring + cost report
+│   ├── scripts/
+│   │   └── resource_monitor.sh      # System metrics collector (JSON)
+│   ├── templates/
+│   │   └── monitoring_report.html.j2  # HTML cost report template
+│   └── docs/
+│       ├── SECURITY_ARCHITECTURE.md # 3-tier design + diagrams
+│       ├── SECURITY_GROUPS.md       # Detailed SG rules + troubleshooting
+│       └── NETWORK_FLOWS.md         # Traffic flows + testing procedures
+└── README.md                        # This file
 ```
 
 ---
 
-## **Important Notes**
+## How to Use
 
-1. **Key Pair**: Ensure the key pair specified in the `key_name` variable exists in the specified AWS region before running the playbook.
-2. **Resource Cleanup**: Keep track of your AWS resources to avoid unnecessary charges. Delete resources manually after testing.
-3. **Security**: Avoid exposing sensitive files, such as variables containing AWS credentials.
+### Deploy (Automatic)
+```bash
+git push origin main
+# Workflow triggers automatically, creates everything from scratch
+```
 
----
+### Deploy (Manual)
+Go to **Actions** > **Deploy 3-Tier Infrastructure** > **Run workflow** > Select `deploy`
 
-## **Troubleshooting**
+### Cleanup All Resources
+Go to **Actions** > **Deploy 3-Tier Infrastructure** > **Run workflow** > Select `cleanup`
 
-### **Common Issues**
-1. **Authentication Failure**: 
-   Ensure your AWS credentials are correctly configured.
-   
-2. **Region-Specific Errors**:
-   Make sure the AMI ID and instance type are valid in your selected `aws_region`.
-
-3. **Permissions Issue**:
-   Check if the AWS IAM user/role has necessary permissions for creating resources.
-
-4. **CIDR Overlap**:
-   Ensure the CIDR blocks do not overlap with other networks in the same AWS account or region.
+### Required GitHub Secrets
+| Secret | Description |
+|--------|-------------|
+| `AWS_ACCESS_KEY_ID` | IAM user with EC2/VPC/ELB/SSM/S3 permissions |
+| `AWS_SECRET_ACCESS_KEY` | Corresponding secret key |
 
 ---
 
-## **Future Enhancements**
+## Key Technical Decisions
 
-- Implement resource cleanup playbooks for automating infrastructure teardown.
-- Add support for additional configurations, such as private subnets and NAT Gateways.
-- Deploy applications on EC2 instances as part of the provisioning process.
+| Decision | Rationale |
+|----------|-----------|
+| **SSM for remote execution** | No SSH needed from GitHub runner to control node |
+| **S3 for code distribution** | Reliable delivery of playbooks + SSH keys |
+| **SSH key reuse** | Checks AWS + S3 before creating new — prevents key mismatch |
+| **`sudo -u ubuntu -H`** | `-H` flag ensures HOME=/home/ubuntu for SSH key resolution |
+| **Temporary DB egress** | Opens HTTP/HTTPS/DNS only for install/patch, then locks down |
+| **SG-to-SG references** | More secure than CIDR — rules follow instances, not IPs |
+| **`serial: 10`** | Process all 10 servers in a tier simultaneously |
+| **Concurrency control** | `cancel-in-progress: true` prevents overlapping deployments |
+| **Idempotent provisioning** | `state: present` with Name tag — safe to rerun |
 
 ---
 
-## **Contributing**
+## Cost Estimate
 
-Feel free to contribute to this project by creating a pull request. Suggestions for improvements are always welcome.
+| Resource | Monthly Cost |
+|----------|-------------|
+| 30 x t3.medium | ~$900 ($0.0416/hr each) |
+| ALB | ~$23 + LCU charges |
+| NAT Gateway | ~$32 + data processing |
+| EBS Storage | ~$0.10/GB/month |
+| Data Transfer | ~$0.09/GB outbound |
+| **Total** | **~$960-1,100/month** |
 
 ---
 
-## **Author**
+## Author
 
-This project is maintained by Olisa Arinze].  
-For any questions or feedback, feel free to contact at **[goad-nitrous-8w@icloud.com
-](mailto:olisa.arinze@icloud.com)**.
-
---- 
-
-This **README.md** follows good documentation practices, making your project easy to understand and use. Let me know if you would like to add more sections or details!
+**Olisa Arinze**
+Contact: olisa.arinze@icloud.com

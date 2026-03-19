@@ -208,6 +208,19 @@ The database tier allows connections on these ports (from app tier only):
 | 27017 | TCP | MongoDB | NoSQL document DB |
 | 6379 | TCP | Redis | In-memory cache/store |
 
+## DB Tier Temporary Egress Pattern
+
+The database tier has `DENY ALL` egress by design. However, package installation and patching
+require temporary internet access. Both `package_install.yml` and `patching.yml` implement
+an automated open/close pattern:
+
+1. **Open** temporary egress on DB tier SG (DNS 53, HTTPS 443, HTTP 80)
+2. **Run** the installation or patching tasks on DB tier servers
+3. **Lock down** egress back to `rules_egress: []` (deny all)
+
+This ensures DB servers never have persistent outbound access while still allowing
+maintenance operations. The egress window is only open for the duration of the task.
+
 ## Deployment Order
 
 1. **Create Security Groups** (must be first)
@@ -220,12 +233,12 @@ The database tier allows connections on these ports (from app tier only):
    ansible-playbook playbooks/provision_servers.yml
    ```
 
-3. **Install Packages** (tier-specific)
+3. **Install Packages** (tier-specific, auto-manages DB egress)
    ```bash
    ansible-playbook playbooks/package_install.yml
    ```
 
-4. **Apply Patches**
+4. **Apply Patches** (tier-specific, auto-manages DB egress)
    ```bash
    ansible-playbook playbooks/patching.yml
    ```
