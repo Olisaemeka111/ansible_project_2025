@@ -90,10 +90,8 @@
       block:
         - name: Download NodeSource setup script
           ansible.builtin.shell: curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
-          args:
-            warn: false
           register: nodejs_setup
-          changed_when: "'added' in nodejs_setup.stdout.lower()"
+          changed_when: nodejs_setup.rc == 0
 
         - name: Install Node.js
           ansible.builtin.apt:
