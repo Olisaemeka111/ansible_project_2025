@@ -458,12 +458,12 @@ ansible-playbook playbooks/configuration/redis_configuration.yml \
 **Key Variables:**
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `mysql_root_password` | *(change this)* | Root password |
+| `mysql_root_password` | *(required)* | Root password (pass via `-e` or Vault) |
 | `mysql_bind_address` | `127.0.0.1` | Bind address |
 | `mysql_max_connections` | `150` | Max connections |
 | `app_db_name` | `application_db` | App database name |
 | `app_db_user` | `app_user` | App database user |
-| `app_db_password` | *(change this)* | App user password |
+| `app_db_password` | *(required)* | App user password (pass via `-e` or Vault) |
 
 **Usage Examples:**
 ```bash

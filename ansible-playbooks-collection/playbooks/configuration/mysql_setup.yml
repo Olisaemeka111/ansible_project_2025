@@ -1,7 +1,10 @@
 ---
 # Ansible Playbook: MySQL 8.0 Setup
 # Installs and configures MySQL 8.0 with application database and user.
-# Usage: ansible-playbook mysql_setup.yml --limit db_servers
+# Usage:
+#   ansible-playbook mysql_setup.yml --limit db_servers \
+#     -e "mysql_root_password='YourRootPass' app_db_password='YourAppPass'"
+#   Or use Ansible Vault: -e @vars/secrets.yml --vault-password-file vault_pass.txt
 
 - name: Install and configure MySQL 8.0
   hosts: all
@@ -9,7 +12,7 @@
   gather_facts: true
 
   vars:
-    mysql_root_password: "Ch@ngeMe!2024"
+    mysql_root_password: ""    # REQUIRED - pass via -e or Ansible Vault
     mysql_bind_address: "127.0.0.1"
     mysql_port: 3306
     mysql_max_connections: 150
@@ -19,7 +22,7 @@
     mysql_collation: "utf8mb4_unicode_ci"
     app_db_name: "application_db"
     app_db_user: "app_user"
-    app_db_password: "AppP@ssw0rd!2024"
+    app_db_password: ""        # REQUIRED - pass via -e or Ansible Vault
     app_db_host: "localhost"
     app_db_privileges: "ALL"
 
@@ -35,6 +38,18 @@
         state: reloaded
 
   tasks:
+    - name: Validate required secrets are provided
+      ansible.builtin.assert:
+        that:
+          - mysql_root_password | length > 0
+          - app_db_password | length > 0
+        fail_msg: >-
+          Passwords must not be empty. Provide them via:
+            -e "mysql_root_password='...' app_db_password='...'"
+          Or use Ansible Vault: -e @vars/secrets.yml --vault-password-file vault_pass.txt
+        success_msg: "Required secrets are set."
+      tags: [always]
+
     - name: Install MySQL 8.0
       tags: [install]
       block:
