@@ -1,0 +1,96 @@
+# Ansible managed - Nginx site configuration
+# Template: nginx.conf.j2
+#
+# Variables:
+#   listen_port    - Port to listen on (default: 80)
+#   server_name    - Server hostname (default: '_' catches all)
+#   document_root  - Web root directory (default: /var/www/html)
+#   enable_ssl     - Enable HTTPS redirect block (default: false)
+#   ssl_cert       - Path to SSL certificate
+#   ssl_key        - Path to SSL private key
+#   client_max_body_size - Max upload size (default: 10m)
+
+server {
+    listen {{ listen_port | default(80) }};
+    server_name {{ server_name | default('_') }};
+    root {{ document_root | default('/var/www/html') }};
+    index index.html index.htm index.php;
+
+    # Max request body size - important for file uploads
+    client_max_body_size {{ client_max_body_size | default('10m') }};
+
+    # Security headers
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-XSS-Protection "1; mode=block" always;
+
+    location / {
+        try_files $uri $uri/ =404;
+    }
+
+{% if enable_php | default(false) %}
+    # PHP-FPM handling
+    location ~ \.php$ {
+        include fastcgi_params;
+        fastcgi_pass unix:/run/php/php{{ php_version | default('8.1') }}-fpm.sock;
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        fastcgi_index index.php;
+    }
+{% endif %}
+
+    # Deny access to hidden files (e.g., .htaccess, .git)
+    location ~ /\. {
+        deny all;
+        access_log off;
+        log_not_found off;
+    }
+
+    # Logging
+    access_log /var/log/nginx/{{ server_name | default('default') }}_access.log;
+    error_log /var/log/nginx/{{ server_name | default('default') }}_error.log;
+}
+
+{% if enable_ssl | default(false) %}
+# HTTPS server block
+server {
+    listen 443 ssl http2;
+    server_name {{ server_name | default('_') }};
+    root {{ document_root | default('/var/www/html') }};
+    index index.html index.htm index.php;
+
+    ssl_certificate {{ ssl_cert }};
+    ssl_certificate_key {{ ssl_key }};
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+    ssl_prefer_server_ciphers on;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 10m;
+
+    client_max_body_size {{ client_max_body_size | default('10m') }};
+
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-XSS-Protection "1; mode=block" always;
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+
+    location / {
+        try_files $uri $uri/ =404;
+    }
+
+    location ~ /\. {
+        deny all;
+        access_log off;
+        log_not_found off;
+    }
+
+    access_log /var/log/nginx/{{ server_name | default('default') }}_ssl_access.log;
+    error_log /var/log/nginx/{{ server_name | default('default') }}_ssl_error.log;
+}
+
+# HTTP to HTTPS redirect
+server {
+    listen {{ listen_port | default(80) }};
+    server_name {{ server_name | default('_') }};
+    return 301 https://$host$request_uri;
+}
+{% endif %}

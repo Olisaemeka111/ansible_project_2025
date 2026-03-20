@@ -1,0 +1,181 @@
+---
+# Ansible Playbook: Logrotate Configuration
+# Configures logrotate for application log files.
+# Usage: ansible-playbook log_rotation.yml --limit app_servers -e app_name=myapp
+
+- name: Configure logrotate for applications
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    app_name: "myapp"
+    log_path: "/var/log/{{ app_name }}/*.log"
+    rotate_count: 14
+    rotate_frequency: "daily"
+    compress_logs: true
+    delay_compress: true
+    max_size: "100M"
+    min_size: "1M"
+    post_rotate_command: ""
+    # Example: post_rotate_command: "systemctl reload myapp"
+    shared_scripts: true
+    missing_ok: true
+    not_if_empty: true
+    create_mode: "0640"
+    create_owner: "root"
+    create_group: "adm"
+    copy_truncate: false
+    date_ext: true
+    date_format: "-%Y%m%d"
+    logrotate_configs:
+      - name: "{{ app_name }}"
+        log_path: "{{ log_path }}"
+        rotate_count: "{{ rotate_count }}"
+        rotate_frequency: "{{ rotate_frequency }}"
+        compress: "{{ compress_logs }}"
+        delay_compress: "{{ delay_compress }}"
+        max_size: "{{ max_size }}"
+        min_size: "{{ min_size }}"
+        post_rotate_command: "{{ post_rotate_command }}"
+        shared_scripts: "{{ shared_scripts }}"
+        missing_ok: "{{ missing_ok }}"
+        not_if_empty: "{{ not_if_empty }}"
+        create_mode: "{{ create_mode }}"
+        create_owner: "{{ create_owner }}"
+        create_group: "{{ create_group }}"
+        copy_truncate: "{{ copy_truncate }}"
+        date_ext: "{{ date_ext }}"
+        date_format: "{{ date_format }}"
+
+  tasks:
+    - name: Install logrotate
+      tags: [install]
+      block:
+        - name: Update apt cache
+          ansible.builtin.apt:
+            update_cache: true
+            cache_valid_time: 3600
+
+        - name: Ensure logrotate is installed
+          ansible.builtin.apt:
+            name: logrotate
+            state: present
+
+    - name: Ensure log directories exist
+      tags: [configure]
+      ansible.builtin.file:
+        path: "{{ item.log_path | dirname }}"
+        state: directory
+        owner: "{{ item.create_owner }}"
+        group: "{{ item.create_group }}"
+        mode: "0755"
+      loop: "{{ logrotate_configs }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when: "'*' not in (item.log_path | dirname)"
+
+    - name: Deploy logrotate configuration for each application
+      tags: [configure]
+      ansible.builtin.copy:
+        content: |
+          # Logrotate configuration for {{ item.name }}
+          # Managed by Ansible - do not edit manually
+
+          {{ item.log_path }} {
+              {{ item.rotate_frequency }}
+              rotate {{ item.rotate_count }}
+              {% if item.max_size is defined and item.max_size %}
+              maxsize {{ item.max_size }}
+              {% endif %}
+              {% if item.min_size is defined and item.min_size %}
+              minsize {{ item.min_size }}
+              {% endif %}
+              {% if item.compress | bool %}
+              compress
+              {% endif %}
+              {% if item.delay_compress | bool %}
+              delaycompress
+              {% endif %}
+              {% if item.missing_ok | bool %}
+              missingok
+              {% endif %}
+              {% if item.not_if_empty | bool %}
+              notifempty
+              {% endif %}
+              {% if item.date_ext | bool %}
+              dateext
+              dateformat {{ item.date_format }}
+              {% endif %}
+              {% if item.copy_truncate | bool %}
+              copytruncate
+              {% else %}
+              create {{ item.create_mode }} {{ item.create_owner }} {{ item.create_group }}
+              {% endif %}
+              {% if item.shared_scripts | bool %}
+              sharedscripts
+              {% endif %}
+              {% if item.post_rotate_command | length > 0 %}
+              postrotate
+                  {{ item.post_rotate_command }}
+              endscript
+              {% endif %}
+          }
+        dest: "/etc/logrotate.d/{{ item.name }}"
+        owner: root
+        group: root
+        mode: "0644"
+      loop: "{{ logrotate_configs }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Verify logrotate configuration
+      tags: [verify]
+      block:
+        - name: Test logrotate configuration with debug mode
+          ansible.builtin.command:
+            cmd: "logrotate -d /etc/logrotate.d/{{ item.name }}"
+          changed_when: false
+          register: logrotate_debug
+          failed_when: false
+          loop: "{{ logrotate_configs }}"
+          loop_control:
+            label: "{{ item.name }}"
+
+        - name: Display logrotate debug output
+          ansible.builtin.debug:
+            msg: "{{ item.stderr_lines | default([]) + item.stdout_lines | default([]) }}"
+          loop: "{{ logrotate_debug.results }}"
+          loop_control:
+            label: "{{ item.item.name }}"
+
+        - name: Validate main logrotate configuration
+          ansible.builtin.command:
+            cmd: logrotate -d /etc/logrotate.conf
+          changed_when: false
+          register: logrotate_main_debug
+          failed_when: false
+
+        - name: Warn if logrotate validation has errors
+          ansible.builtin.debug:
+            msg: >-
+              WARNING: logrotate configuration validation reported issues.
+              Review the debug output above for details.
+          when: logrotate_main_debug.rc != 0
+
+    - name: Verify logrotate timer is active
+      tags: [verify]
+      block:
+        - name: Check logrotate timer status
+          ansible.builtin.command:
+            cmd: systemctl status logrotate.timer
+          changed_when: false
+          register: logrotate_timer
+          failed_when: false
+
+        - name: Enable logrotate timer if not active
+          ansible.builtin.systemd:
+            name: logrotate.timer
+            state: started
+            enabled: true
+          when: logrotate_timer.rc != 0

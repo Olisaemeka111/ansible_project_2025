@@ -1,0 +1,37 @@
+[Unit]
+Description={{ app_name }} Rust Rocket Application
+After=network.target
+
+[Service]
+Type=simple
+User={{ app_user | default(app_name) }}
+Group={{ app_user | default(app_name) }}
+WorkingDirectory={{ app_dir }}
+ExecStart={{ app_dir }}/{{ app_name }}
+Restart=always
+RestartSec=5
+
+# Rocket environment
+Environment="ROCKET_ADDRESS=0.0.0.0"
+Environment="ROCKET_PORT={{ app_port | default(8000) }}"
+Environment="ROCKET_PROFILE={{ rocket_env | default('release') }}"
+{% if rocket_secret_key is defined %}
+Environment="ROCKET_SECRET_KEY={{ rocket_secret_key }}"
+{% endif %}
+{% if database_url is defined %}
+Environment="DATABASE_URL={{ database_url }}"
+{% endif %}
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier={{ app_name }}
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

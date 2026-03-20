@@ -1,0 +1,235 @@
+---
+# Ansible Playbook: MySQL 8.0 Setup
+# Installs and configures MySQL 8.0 with application database and user.
+# Usage: ansible-playbook mysql_setup.yml --limit db_servers
+
+- name: Install and configure MySQL 8.0
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    mysql_root_password: "Ch@ngeMe!2024"
+    mysql_bind_address: "127.0.0.1"
+    mysql_port: 3306
+    mysql_max_connections: 150
+    mysql_innodb_buffer_pool_size: "256M"
+    mysql_innodb_log_file_size: "64M"
+    mysql_character_set: "utf8mb4"
+    mysql_collation: "utf8mb4_unicode_ci"
+    app_db_name: "application_db"
+    app_db_user: "app_user"
+    app_db_password: "AppP@ssw0rd!2024"
+    app_db_host: "localhost"
+    app_db_privileges: "ALL"
+
+  handlers:
+    - name: Restart mysql service
+      ansible.builtin.systemd:
+        name: mysql
+        state: restarted
+
+    - name: Reload mysql service
+      ansible.builtin.systemd:
+        name: mysql
+        state: reloaded
+
+  tasks:
+    - name: Install MySQL 8.0
+      tags: [install]
+      block:
+        - name: Update apt cache
+          ansible.builtin.apt:
+            update_cache: true
+            cache_valid_time: 3600
+
+        - name: Install MySQL server and dependencies
+          ansible.builtin.apt:
+            name:
+              - mysql-server
+              - mysql-client
+              - python3-pymysql
+              - python3-mysqldb
+            state: present
+
+    - name: Start MySQL service for initial configuration
+      tags: [install]
+      ansible.builtin.systemd:
+        name: mysql
+        state: started
+        enabled: true
+
+    - name: Secure MySQL installation
+      tags: [configure, security]
+      block:
+        - name: Set MySQL root password
+          community.mysql.mysql_user:
+            name: root
+            host: localhost
+            password: "{{ mysql_root_password }}"
+            login_unix_socket: /var/run/mysqld/mysqld.sock
+            state: present
+          no_log: true
+
+        - name: Create .my.cnf for root user
+          ansible.builtin.copy:
+            content: |
+              [client]
+              user=root
+              password={{ mysql_root_password }}
+              socket=/var/run/mysqld/mysqld.sock
+            dest: /root/.my.cnf
+            owner: root
+            group: root
+            mode: "0600"
+          no_log: true
+
+        - name: Remove anonymous MySQL users
+          community.mysql.mysql_user:
+            name: ""
+            host_all: true
+            state: absent
+            login_unix_socket: /var/run/mysqld/mysqld.sock
+            login_user: root
+            login_password: "{{ mysql_root_password }}"
+
+        - name: Remove MySQL test database
+          community.mysql.mysql_db:
+            name: test
+            state: absent
+            login_unix_socket: /var/run/mysqld/mysqld.sock
+            login_user: root
+            login_password: "{{ mysql_root_password }}"
+
+        - name: Disallow root login remotely
+          community.mysql.mysql_user:
+            name: root
+            host: "{{ item }}"
+            state: absent
+            login_unix_socket: /var/run/mysqld/mysqld.sock
+            login_user: root
+            login_password: "{{ mysql_root_password }}"
+          loop:
+            - "{{ ansible_hostname }}"
+            - "127.0.0.1"
+            - "::1"
+          when: item != 'localhost'
+
+    - name: Configure MySQL server
+      tags: [configure]
+      block:
+        - name: Deploy MySQL server configuration
+          ansible.builtin.copy:
+            content: |
+              # MySQL Server Configuration
+              # Managed by Ansible - do not edit manually
+
+              [mysqld]
+              # Network
+              bind-address = {{ mysql_bind_address }}
+              port = {{ mysql_port }}
+              mysqlx = 0
+
+              # Character Set
+              character-set-server = {{ mysql_character_set }}
+              collation-server = {{ mysql_collation }}
+
+              # Connection Limits
+              max_connections = {{ mysql_max_connections }}
+              max_connect_errors = 100000
+
+              # InnoDB Settings
+              innodb_buffer_pool_size = {{ mysql_innodb_buffer_pool_size }}
+              innodb_log_file_size = {{ mysql_innodb_log_file_size }}
+              innodb_flush_log_at_trx_commit = 1
+              innodb_file_per_table = 1
+              innodb_flush_method = O_DIRECT
+              innodb_log_buffer_size = 16M
+
+              # Logging
+              log_error = /var/log/mysql/error.log
+              slow_query_log = 1
+              slow_query_log_file = /var/log/mysql/mysql-slow.log
+              long_query_time = 2
+              log_queries_not_using_indexes = 1
+
+              # Security
+              local_infile = 0
+              skip-symbolic-links
+
+              # Temporary Tables
+              tmp_table_size = 64M
+              max_heap_table_size = 64M
+
+              [client]
+              default-character-set = {{ mysql_character_set }}
+            dest: /etc/mysql/mysql.conf.d/99-ansible.cnf
+            owner: root
+            group: root
+            mode: "0644"
+          notify: Restart mysql service
+
+    - name: Create application database and user
+      tags: [configure, database]
+      block:
+        - name: Create application database
+          community.mysql.mysql_db:
+            name: "{{ app_db_name }}"
+            state: present
+            encoding: "{{ mysql_character_set }}"
+            collation: "{{ mysql_collation }}"
+            login_unix_socket: /var/run/mysqld/mysqld.sock
+            login_user: root
+            login_password: "{{ mysql_root_password }}"
+
+        - name: Create application database user
+          community.mysql.mysql_user:
+            name: "{{ app_db_user }}"
+            host: "{{ app_db_host }}"
+            password: "{{ app_db_password }}"
+            priv: "{{ app_db_name }}.*:{{ app_db_privileges }}"
+            state: present
+            login_unix_socket: /var/run/mysqld/mysqld.sock
+            login_user: root
+            login_password: "{{ mysql_root_password }}"
+          no_log: true
+
+    - name: Verify MySQL installation
+      tags: [verify]
+      block:
+        - name: Check MySQL service status
+          ansible.builtin.systemd:
+            name: mysql
+          register: mysql_service
+
+        - name: Display MySQL service status
+          ansible.builtin.debug:
+            msg: "MySQL service is {{ mysql_service.status.ActiveState }}"
+
+        - name: Verify MySQL version
+          ansible.builtin.command:
+            cmd: mysql --version
+          changed_when: false
+          register: mysql_version
+
+        - name: Display MySQL version
+          ansible.builtin.debug:
+            msg: "{{ mysql_version.stdout }}"
+
+        - name: Test application database connection
+          community.mysql.mysql_info:
+            login_user: "{{ app_db_user }}"
+            login_password: "{{ app_db_password }}"
+            login_host: "{{ app_db_host }}"
+            login_port: "{{ mysql_port }}"
+            filter:
+              - databases
+          register: mysql_info
+          no_log: true
+
+        - name: Verify application database exists
+          ansible.builtin.assert:
+            that:
+              - app_db_name in mysql_info.databases
+            success_msg: "Application database '{{ app_db_name }}' is accessible by user '{{ app_db_user }}'"
+            fail_msg: "Application database '{{ app_db_name }}' is not accessible"

@@ -1,0 +1,167 @@
+---
+# Ansible Playbook: UFW Firewall Configuration
+# Configures UFW firewall with sensible defaults and customizable rules.
+# Usage: ansible-playbook ufw_firewall.yml --limit all
+
+- name: Configure UFW firewall
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    ufw_default_incoming: "deny"
+    ufw_default_outgoing: "allow"
+    ufw_default_forward: "deny"
+    ufw_logging: "low"
+    ufw_ssh_port: 22
+    ufw_ssh_rate_limit: true
+    ufw_base_rules:
+      - port: "22"
+        proto: "tcp"
+        rule: "allow"
+        comment: "SSH access"
+      - port: "80"
+        proto: "tcp"
+        rule: "allow"
+        comment: "HTTP traffic"
+      - port: "443"
+        proto: "tcp"
+        rule: "allow"
+        comment: "HTTPS traffic"
+    ufw_allowed_ports: []
+    # Example format for ufw_allowed_ports:
+    # - port: "8080"
+    #   proto: "tcp"
+    #   from: "any"
+    #   comment: "Application port"
+    # - port: "5432"
+    #   proto: "tcp"
+    #   from: "10.0.0.0/8"
+    #   comment: "PostgreSQL from internal network"
+    ufw_deny_ports: []
+    # Example format for ufw_deny_ports:
+    # - port: "23"
+    #   proto: "tcp"
+    #   comment: "Block telnet"
+
+  handlers:
+    - name: Reload ufw
+      community.general.ufw:
+        state: reloaded
+
+  tasks:
+    - name: Install UFW
+      tags: [install]
+      block:
+        - name: Update apt cache
+          ansible.builtin.apt:
+            update_cache: true
+            cache_valid_time: 3600
+
+        - name: Install ufw package
+          ansible.builtin.apt:
+            name: ufw
+            state: present
+
+    - name: Reset UFW to defaults before configuring
+      tags: [configure]
+      community.general.ufw:
+        state: reset
+      when: false  # Set to true to reset all rules before applying
+
+    - name: Set UFW default policies
+      tags: [configure, policies]
+      block:
+        - name: Set default incoming policy
+          community.general.ufw:
+            direction: incoming
+            default: "{{ ufw_default_incoming }}"
+
+        - name: Set default outgoing policy
+          community.general.ufw:
+            direction: outgoing
+            default: "{{ ufw_default_outgoing }}"
+
+        - name: Set default forward policy
+          community.general.ufw:
+            direction: routed
+            default: "{{ ufw_default_forward }}"
+
+    - name: Configure UFW logging
+      tags: [configure]
+      community.general.ufw:
+        logging: "{{ ufw_logging }}"
+
+    - name: Configure SSH with rate limiting
+      tags: [configure, ssh]
+      community.general.ufw:
+        rule: limit
+        port: "{{ ufw_ssh_port | string }}"
+        proto: tcp
+        comment: "SSH rate limiting"
+      when: ufw_ssh_rate_limit | bool
+
+    - name: Apply base firewall rules
+      tags: [configure, rules]
+      community.general.ufw:
+        rule: "{{ item.rule | default('allow') }}"
+        port: "{{ item.port }}"
+        proto: "{{ item.proto | default('tcp') }}"
+        comment: "{{ item.comment | default('Ansible managed rule') }}"
+      loop: "{{ ufw_base_rules }}"
+      loop_control:
+        label: "{{ item.comment | default(item.port) }}"
+      when: not (ufw_ssh_rate_limit and item.port == (ufw_ssh_port | string))
+
+    - name: Apply additional allowed port rules
+      tags: [configure, rules]
+      community.general.ufw:
+        rule: allow
+        port: "{{ item.port }}"
+        proto: "{{ item.proto | default('tcp') }}"
+        from_ip: "{{ item.from | default('any') }}"
+        comment: "{{ item.comment | default('Ansible managed rule - port ' + item.port) }}"
+      loop: "{{ ufw_allowed_ports }}"
+      loop_control:
+        label: "{{ item.comment | default(item.port) }}"
+      when: ufw_allowed_ports | length > 0
+
+    - name: Apply deny rules
+      tags: [configure, rules]
+      community.general.ufw:
+        rule: deny
+        port: "{{ item.port }}"
+        proto: "{{ item.proto | default('tcp') }}"
+        comment: "{{ item.comment | default('Ansible managed deny rule') }}"
+      loop: "{{ ufw_deny_ports }}"
+      loop_control:
+        label: "{{ item.comment | default(item.port) }}"
+      when: ufw_deny_ports | length > 0
+
+    - name: Enable UFW
+      tags: [configure, enable]
+      community.general.ufw:
+        state: enabled
+
+    - name: Verify UFW configuration
+      tags: [verify]
+      block:
+        - name: Get UFW status
+          ansible.builtin.command:
+            cmd: ufw status verbose
+          changed_when: false
+          register: ufw_status
+
+        - name: Display UFW status
+          ansible.builtin.debug:
+            msg: "{{ ufw_status.stdout_lines }}"
+
+        - name: Get UFW numbered rules
+          ansible.builtin.command:
+            cmd: ufw status numbered
+          changed_when: false
+          register: ufw_rules
+
+        - name: Display UFW rules
+          ansible.builtin.debug:
+            msg: "{{ ufw_rules.stdout_lines }}"

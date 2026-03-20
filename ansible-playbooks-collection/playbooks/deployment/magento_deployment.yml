@@ -1,0 +1,488 @@
+---
+# Playbook: Deploy Magento 2 E-Commerce Platform
+# Target OS: Ubuntu 22.04
+# Requires: MySQL/MariaDB, Elasticsearch/OpenSearch, Redis (recommended)
+# Usage: ansible-playbook magento_deployment.yml -e "domain=shop.example.com db_host=db.local"
+
+- name: Deploy Magento 2 E-Commerce Application
+  hosts: all
+  become: true
+
+  vars:
+    app_name: "magento"
+    app_dir: "/var/www/{{ app_name }}"
+    magento_version: "2.4.7"
+    php_version: "8.2"
+    domain: "shop.example.com"
+    db_host: "localhost"
+    db_name: "magento"
+    db_user: "magento"
+    db_password: "CHANGE_ME_magento_db_password"
+    admin_user: "admin"
+    admin_password: "CHANGE_ME_admin_password"
+    admin_email: "admin@example.com"
+    admin_firstname: "Admin"
+    admin_lastname: "User"
+    admin_url_path: "admin_secure"
+    elasticsearch_host: "localhost"
+    elasticsearch_port: 9200
+    redis_host: "localhost"
+    redis_port: 6379
+    app_user: "magento"
+    app_group: "www-data"
+    git_repo: ""
+    git_branch: "main"
+    composer_auth_public_key: ""
+    composer_auth_private_key: ""
+    php_memory_limit: "2G"
+    php_max_execution_time: "1800"
+    php_fpm_listen: "/run/php/php{{ php_version }}-fpm-{{ app_name }}.sock"
+    php_extensions:
+      - "php{{ php_version }}-fpm"
+      - "php{{ php_version }}-mysql"
+      - "php{{ php_version }}-mbstring"
+      - "php{{ php_version }}-xml"
+      - "php{{ php_version }}-curl"
+      - "php{{ php_version }}-gd"
+      - "php{{ php_version }}-zip"
+      - "php{{ php_version }}-intl"
+      - "php{{ php_version }}-soap"
+      - "php{{ php_version }}-xsl"
+      - "php{{ php_version }}-bcmath"
+      - "php{{ php_version }}-opcache"
+      - "php{{ php_version }}-readline"
+      - "php{{ php_version }}-redis"
+      - "php{{ php_version }}-sodium"
+
+  handlers:
+    - name: Restart php-fpm
+      ansible.builtin.systemd:
+        name: "php{{ php_version }}-fpm"
+        state: restarted
+        daemon_reload: true
+      tags:
+        - php
+
+    - name: Reload nginx
+      ansible.builtin.systemd:
+        name: nginx
+        state: reloaded
+      tags:
+        - nginx
+
+    - name: Restart nginx
+      ansible.builtin.systemd:
+        name: nginx
+        state: restarted
+      tags:
+        - nginx
+
+    - name: Flush Magento cache
+      ansible.builtin.command:
+        cmd: "php bin/magento cache:flush"
+        chdir: "{{ app_dir }}"
+      become_user: "{{ app_user }}"
+      tags:
+        - magento
+
+  tasks:
+    # ------------------------------------------------------------------
+    # System Prerequisites
+    # ------------------------------------------------------------------
+    - name: Install system prerequisites
+      tags:
+        - install
+        - prerequisites
+      block:
+        - name: Install prerequisite packages
+          ansible.builtin.apt:
+            name:
+              - software-properties-common
+              - apt-transport-https
+              - ca-certificates
+              - gnupg
+              - git
+              - unzip
+              - acl
+              - curl
+            state: present
+            update_cache: true
+
+        - name: Add Ondrej PHP PPA repository
+          ansible.builtin.apt_repository:
+            repo: "ppa:ondrej/php"
+            state: present
+            update_cache: true
+
+    # ------------------------------------------------------------------
+    # PHP Installation
+    # ------------------------------------------------------------------
+    - name: Install PHP and Magento-required extensions
+      tags:
+        - php
+        - install
+      block:
+        - name: Install PHP {{ php_version }} and all required extensions
+          ansible.builtin.apt:
+            name: "{{ ['php' + php_version, 'php' + php_version + '-cli'] + php_extensions }}"
+            state: present
+            update_cache: true
+
+        - name: Configure PHP CLI for Magento
+          ansible.builtin.lineinfile:
+            path: "/etc/php/{{ php_version }}/cli/php.ini"
+            regexp: "^{{ item.key }}"
+            line: "{{ item.key }} = {{ item.value }}"
+          loop:
+            - { key: "memory_limit", value: "{{ php_memory_limit }}" }
+            - { key: "max_execution_time", value: "{{ php_max_execution_time }}" }
+            - { key: "realpath_cache_size", value: "10M" }
+            - { key: "realpath_cache_ttl", value: "7200" }
+
+        - name: Configure PHP-FPM for Magento
+          ansible.builtin.lineinfile:
+            path: "/etc/php/{{ php_version }}/fpm/php.ini"
+            regexp: "^{{ item.key }}"
+            line: "{{ item.key }} = {{ item.value }}"
+          loop:
+            - { key: "memory_limit", value: "{{ php_memory_limit }}" }
+            - { key: "max_execution_time", value: "{{ php_max_execution_time }}" }
+            - { key: "realpath_cache_size", value: "10M" }
+            - { key: "realpath_cache_ttl", value: "7200" }
+            - { key: "opcache.save_comments", value: "1" }
+          notify: Restart php-fpm
+
+    # ------------------------------------------------------------------
+    # Composer Installation
+    # ------------------------------------------------------------------
+    - name: Install Composer
+      tags:
+        - composer
+        - install
+      block:
+        - name: Download Composer installer
+          ansible.builtin.get_url:
+            url: "https://getcomposer.org/installer"
+            dest: "/tmp/composer-setup.php"
+            mode: "0755"
+
+        - name: Install Composer globally
+          ansible.builtin.command:
+            cmd: "php /tmp/composer-setup.php --install-dir=/usr/local/bin --filename=composer"
+            creates: "/usr/local/bin/composer"
+
+    # ------------------------------------------------------------------
+    # Application User and Directory Setup
+    # ------------------------------------------------------------------
+    - name: Create Magento application user
+      tags:
+        - setup
+      block:
+        - name: Create Magento system user
+          ansible.builtin.user:
+            name: "{{ app_user }}"
+            group: "{{ app_group }}"
+            home: "/home/{{ app_user }}"
+            shell: "/bin/bash"
+            system: true
+            create_home: true
+
+        - name: Create application directory
+          ansible.builtin.file:
+            path: "{{ app_dir }}"
+            state: directory
+            owner: "{{ app_user }}"
+            group: "{{ app_group }}"
+            mode: "0755"
+
+        - name: Configure Composer auth for Magento Marketplace
+          ansible.builtin.template:
+            src: "templates/magento_composer_auth.json.j2"
+            dest: "/home/{{ app_user }}/.config/composer/auth.json"
+            owner: "{{ app_user }}"
+            group: "{{ app_group }}"
+            mode: "0600"
+          when: composer_auth_public_key | length > 0
+
+    # ------------------------------------------------------------------
+    # Magento Application Deployment
+    # ------------------------------------------------------------------
+    - name: Deploy Magento application
+      tags:
+        - deploy
+        - magento
+      block:
+        - name: Clone Magento from Git repository
+          ansible.builtin.git:
+            repo: "{{ git_repo }}"
+            dest: "{{ app_dir }}"
+            version: "{{ git_branch }}"
+            force: true
+          become_user: "{{ app_user }}"
+          when: git_repo | length > 0
+
+        - name: Create Magento project via Composer (fresh install)
+          ansible.builtin.command:
+            cmd: >
+              composer create-project
+              --repository-url=https://repo.magento.com/
+              magento/project-community-edition={{ magento_version }}
+              {{ app_dir }}
+              --no-interaction
+            creates: "{{ app_dir }}/composer.json"
+          become_user: "{{ app_user }}"
+          environment:
+            COMPOSER_HOME: "/home/{{ app_user }}/.config/composer"
+          when: git_repo | length == 0
+
+        - name: Install Composer dependencies
+          ansible.builtin.command:
+            cmd: "composer install --no-dev --optimize-autoloader --no-interaction"
+            chdir: "{{ app_dir }}"
+          become_user: "{{ app_user }}"
+          environment:
+            COMPOSER_HOME: "/home/{{ app_user }}/.config/composer"
+            COMPOSER_MEMORY_LIMIT: "-1"
+          register: composer_result
+          changed_when: "'Nothing to install' not in composer_result.stdout"
+
+    # ------------------------------------------------------------------
+    # Magento File Permissions
+    # ------------------------------------------------------------------
+    - name: Set Magento file permissions
+      tags:
+        - permissions
+        - magento
+      block:
+        - name: Set ownership on Magento directory
+          ansible.builtin.file:
+            path: "{{ app_dir }}"
+            owner: "{{ app_user }}"
+            group: "{{ app_group }}"
+            recurse: true
+
+        - name: Set directory permissions (directories to 2775)
+          ansible.builtin.command:
+            cmd: "find {{ app_dir }} -type d -exec chmod 2775 {} +"
+          changed_when: true
+
+        - name: Set file permissions (files to 0664)
+          ansible.builtin.command:
+            cmd: "find {{ app_dir }} -type f -exec chmod 0664 {} +"
+          changed_when: true
+
+        - name: Make bin/magento executable
+          ansible.builtin.file:
+            path: "{{ app_dir }}/bin/magento"
+            mode: "0775"
+
+        - name: Ensure var, generated, pub/static, pub/media are writable
+          ansible.builtin.file:
+            path: "{{ app_dir }}/{{ item }}"
+            state: directory
+            owner: "{{ app_user }}"
+            group: "{{ app_group }}"
+            mode: "2775"
+          loop:
+            - var
+            - generated
+            - pub/static
+            - pub/media
+            - app/etc
+
+    # ------------------------------------------------------------------
+    # PHP-FPM Configuration
+    # ------------------------------------------------------------------
+    - name: Configure PHP-FPM for Magento
+      tags:
+        - php
+        - config
+      block:
+        - name: Deploy PHP-FPM pool configuration for Magento
+          ansible.builtin.template:
+            src: "templates/magento_fpm.conf.j2"
+            dest: "/etc/php/{{ php_version }}/fpm/pool.d/{{ app_name }}.conf"
+            owner: root
+            group: root
+            mode: "0644"
+          notify: Restart php-fpm
+
+        - name: Remove default PHP-FPM pool
+          ansible.builtin.file:
+            path: "/etc/php/{{ php_version }}/fpm/pool.d/www.conf"
+            state: absent
+          notify: Restart php-fpm
+
+        - name: Ensure PHP-FPM is enabled and running
+          ansible.builtin.systemd:
+            name: "php{{ php_version }}-fpm"
+            state: started
+            enabled: true
+
+    # ------------------------------------------------------------------
+    # Nginx Configuration
+    # ------------------------------------------------------------------
+    - name: Configure Nginx for Magento
+      tags:
+        - nginx
+        - config
+      block:
+        - name: Install Nginx
+          ansible.builtin.apt:
+            name: nginx
+            state: present
+
+        - name: Remove default Nginx site
+          ansible.builtin.file:
+            path: "/etc/nginx/sites-enabled/default"
+            state: absent
+          notify: Reload nginx
+
+        - name: Deploy Magento Nginx configuration
+          ansible.builtin.template:
+            src: "templates/magento.conf.j2"
+            dest: "/etc/nginx/sites-available/{{ app_name }}.conf"
+            owner: root
+            group: root
+            mode: "0644"
+          notify: Reload nginx
+
+        - name: Enable Magento Nginx virtual host
+          ansible.builtin.file:
+            src: "/etc/nginx/sites-available/{{ app_name }}.conf"
+            dest: "/etc/nginx/sites-enabled/{{ app_name }}.conf"
+            state: link
+          notify: Reload nginx
+
+        - name: Validate Nginx configuration
+          ansible.builtin.command:
+            cmd: "nginx -t"
+          changed_when: false
+
+        - name: Ensure Nginx is enabled and running
+          ansible.builtin.systemd:
+            name: nginx
+            state: started
+            enabled: true
+
+    # ------------------------------------------------------------------
+    # Magento Setup (Optional - First-time install)
+    # ------------------------------------------------------------------
+    - name: Run Magento setup (first-time install)
+      tags:
+        - setup
+        - magento
+        - never
+      block:
+        - name: Run Magento setup install
+          ansible.builtin.command:
+            cmd: >
+              php bin/magento setup:install
+              --base-url=https://{{ domain }}/
+              --db-host={{ db_host }}
+              --db-name={{ db_name }}
+              --db-user={{ db_user }}
+              --db-password={{ db_password }}
+              --admin-firstname={{ admin_firstname }}
+              --admin-lastname={{ admin_lastname }}
+              --admin-email={{ admin_email }}
+              --admin-user={{ admin_user }}
+              --admin-password={{ admin_password }}
+              --backend-frontname={{ admin_url_path }}
+              --language=en_US
+              --currency=USD
+              --timezone=America/New_York
+              --use-rewrites=1
+              --search-engine=elasticsearch7
+              --elasticsearch-host={{ elasticsearch_host }}
+              --elasticsearch-port={{ elasticsearch_port }}
+              --session-save=redis
+              --session-save-redis-host={{ redis_host }}
+              --session-save-redis-port={{ redis_port }}
+              --session-save-redis-db=0
+              --cache-backend=redis
+              --cache-backend-redis-server={{ redis_host }}
+              --cache-backend-redis-port={{ redis_port }}
+              --cache-backend-redis-db=1
+            chdir: "{{ app_dir }}"
+          become_user: "{{ app_user }}"
+
+        - name: Deploy static content
+          ansible.builtin.command:
+            cmd: "php bin/magento setup:static-content:deploy -f"
+            chdir: "{{ app_dir }}"
+          become_user: "{{ app_user }}"
+
+        - name: Reindex Magento
+          ansible.builtin.command:
+            cmd: "php bin/magento indexer:reindex"
+            chdir: "{{ app_dir }}"
+          become_user: "{{ app_user }}"
+
+        - name: Flush Magento cache
+          ansible.builtin.command:
+            cmd: "php bin/magento cache:flush"
+            chdir: "{{ app_dir }}"
+          become_user: "{{ app_user }}"
+
+    # ------------------------------------------------------------------
+    # Magento Cron Setup
+    # ------------------------------------------------------------------
+    - name: Configure Magento cron jobs
+      tags:
+        - cron
+        - magento
+      block:
+        - name: Set up Magento cron job
+          ansible.builtin.cron:
+            name: "Magento cron run"
+            minute: "*/1"
+            job: "php {{ app_dir }}/bin/magento cron:run 2>&1 | grep -v 'Ran jobs by schedule' >> {{ app_dir }}/var/log/magento.cron.log"
+            user: "{{ app_user }}"
+
+        - name: Set up Magento cron install
+          ansible.builtin.command:
+            cmd: "php bin/magento cron:install"
+            chdir: "{{ app_dir }}"
+          become_user: "{{ app_user }}"
+          register: cron_install
+          changed_when: "'already exists' not in cron_install.stdout"
+          failed_when: false
+
+    # ------------------------------------------------------------------
+    # Health Check
+    # ------------------------------------------------------------------
+    - name: Verify Magento deployment
+      tags:
+        - verify
+      block:
+        - name: Wait for PHP-FPM socket
+          ansible.builtin.wait_for:
+            path: "{{ php_fpm_listen }}"
+            state: present
+            timeout: 30
+
+        - name: Check Magento status
+          ansible.builtin.command:
+            cmd: "php bin/magento info:version"
+            chdir: "{{ app_dir }}"
+          become_user: "{{ app_user }}"
+          register: magento_version_check
+          changed_when: false
+
+        - name: Display Magento version
+          ansible.builtin.debug:
+            msg: "Magento version: {{ magento_version_check.stdout }}"
+
+        - name: Wait for Nginx to respond
+          ansible.builtin.uri:
+            url: "http://localhost"
+            status_code:
+              - 200
+              - 301
+              - 302
+            timeout: 15
+          register: health_result
+          retries: 5
+          delay: 5
+          until: health_result is succeeded

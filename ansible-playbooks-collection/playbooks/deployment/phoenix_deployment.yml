@@ -1,0 +1,354 @@
+---
+# Playbook: Deploy Elixir Phoenix Application
+# Target OS: Ubuntu 22.04
+# Requires: PostgreSQL database, Git repository with Phoenix project
+# Usage: ansible-playbook phoenix_deployment.yml -e "git_repo=https://github.com/org/app.git database_url=ecto://user:pass@db/app_prod"
+
+- name: Deploy Elixir Phoenix Application
+  hosts: all
+  become: true
+
+  vars:
+    app_name: "phoenix-app"
+    app_dir: "/opt/{{ app_name }}"
+    app_port: 4000
+    git_repo: "https://github.com/example/phoenix-app.git"
+    git_branch: "main"
+    app_user: "phoenix"
+    app_group: "phoenix"
+    secret_key_base: "CHANGE_ME_generate_with_mix_phx_gen_secret"
+    database_url: "ecto://postgres:password@localhost/app_prod"
+    server_name: "app.example.com"
+    elixir_version: "1.17"
+    erlang_version: "27"
+    mix_env: "prod"
+    release_name: "{{ app_name | replace('-', '_') }}"
+    phx_host: "{{ server_name }}"
+    pool_size: 10
+    log_dir: "/var/log/{{ app_name }}"
+
+  handlers:
+    - name: Restart phoenix
+      ansible.builtin.systemd:
+        name: "{{ app_name }}"
+        state: restarted
+        daemon_reload: true
+      tags:
+        - phoenix
+
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+      tags:
+        - phoenix
+
+    - name: Reload nginx
+      ansible.builtin.systemd:
+        name: nginx
+        state: reloaded
+      tags:
+        - nginx
+
+    - name: Restart nginx
+      ansible.builtin.systemd:
+        name: nginx
+        state: restarted
+      tags:
+        - nginx
+
+  tasks:
+    # ------------------------------------------------------------------
+    # Erlang and Elixir Installation
+    # ------------------------------------------------------------------
+    - name: Install Erlang and Elixir
+      tags:
+        - install
+        - elixir
+      block:
+        - name: Install prerequisite packages
+          ansible.builtin.apt:
+            name:
+              - software-properties-common
+              - apt-transport-https
+              - ca-certificates
+              - gnupg
+              - git
+              - build-essential
+              - curl
+              - inotify-tools
+            state: present
+            update_cache: true
+
+        - name: Add Erlang Solutions GPG key
+          ansible.builtin.get_url:
+            url: "https://packages.erlang-solutions.com/ubuntu/erlang_solutions.asc"
+            dest: "/etc/apt/trusted.gpg.d/erlang_solutions.asc"
+            mode: "0644"
+
+        - name: Add Erlang Solutions repository
+          ansible.builtin.apt_repository:
+            repo: "deb https://packages.erlang-solutions.com/ubuntu {{ ansible_distribution_release }} contrib"
+            state: present
+            filename: "erlang-solutions"
+            update_cache: true
+
+        - name: Install Erlang/OTP
+          ansible.builtin.apt:
+            name:
+              - esl-erlang
+            state: present
+            update_cache: true
+
+        - name: Install Elixir
+          ansible.builtin.apt:
+            name:
+              - elixir
+            state: present
+
+        - name: Verify Elixir installation
+          ansible.builtin.command:
+            cmd: "elixir --version"
+          changed_when: false
+          register: elixir_check
+
+        - name: Display Elixir version
+          ansible.builtin.debug:
+            msg: "{{ elixir_check.stdout_lines }}"
+
+    # ------------------------------------------------------------------
+    # Application User Setup
+    # ------------------------------------------------------------------
+    - name: Create application user
+      tags:
+        - setup
+      block:
+        - name: Create Phoenix application group
+          ansible.builtin.group:
+            name: "{{ app_group }}"
+            system: true
+
+        - name: Create Phoenix application user
+          ansible.builtin.user:
+            name: "{{ app_user }}"
+            group: "{{ app_group }}"
+            home: "/home/{{ app_user }}"
+            shell: "/bin/bash"
+            system: true
+            create_home: true
+
+        - name: Create application directory
+          ansible.builtin.file:
+            path: "{{ app_dir }}"
+            state: directory
+            owner: "{{ app_user }}"
+            group: "{{ app_group }}"
+            mode: "0755"
+
+        - name: Create log directory
+          ansible.builtin.file:
+            path: "{{ log_dir }}"
+            state: directory
+            owner: "{{ app_user }}"
+            group: "{{ app_group }}"
+            mode: "0755"
+
+    # ------------------------------------------------------------------
+    # Application Deployment
+    # ------------------------------------------------------------------
+    - name: Deploy Phoenix application
+      tags:
+        - deploy
+        - phoenix
+      block:
+        - name: Clone application repository
+          ansible.builtin.git:
+            repo: "{{ git_repo }}"
+            dest: "{{ app_dir }}/source"
+            version: "{{ git_branch }}"
+            force: true
+          become_user: "{{ app_user }}"
+
+        - name: Install local Hex
+          ansible.builtin.command:
+            cmd: "mix local.hex --force"
+          become_user: "{{ app_user }}"
+          environment:
+            HOME: "/home/{{ app_user }}"
+            MIX_ENV: "{{ mix_env }}"
+          changed_when: true
+
+        - name: Install local rebar
+          ansible.builtin.command:
+            cmd: "mix local.rebar --force"
+          become_user: "{{ app_user }}"
+          environment:
+            HOME: "/home/{{ app_user }}"
+            MIX_ENV: "{{ mix_env }}"
+          changed_when: true
+
+        - name: Fetch dependencies
+          ansible.builtin.command:
+            cmd: "mix deps.get --only {{ mix_env }}"
+            chdir: "{{ app_dir }}/source"
+          become_user: "{{ app_user }}"
+          environment:
+            HOME: "/home/{{ app_user }}"
+            MIX_ENV: "{{ mix_env }}"
+          register: deps_result
+          changed_when: "'All dependencies are up to date' not in deps_result.stdout"
+
+        - name: Compile application
+          ansible.builtin.command:
+            cmd: "mix compile"
+            chdir: "{{ app_dir }}/source"
+          become_user: "{{ app_user }}"
+          environment:
+            HOME: "/home/{{ app_user }}"
+            MIX_ENV: "{{ mix_env }}"
+          register: compile_result
+          changed_when: "'Compiled' in compile_result.stdout"
+
+        - name: Compile assets (if assets directory exists)
+          ansible.builtin.command:
+            cmd: "mix assets.deploy"
+            chdir: "{{ app_dir }}/source"
+          become_user: "{{ app_user }}"
+          environment:
+            HOME: "/home/{{ app_user }}"
+            MIX_ENV: "{{ mix_env }}"
+          register: assets_result
+          failed_when: false
+          changed_when: assets_result.rc == 0
+
+        - name: Run database migrations
+          ansible.builtin.command:
+            cmd: "mix ecto.migrate"
+            chdir: "{{ app_dir }}/source"
+          become_user: "{{ app_user }}"
+          environment:
+            HOME: "/home/{{ app_user }}"
+            MIX_ENV: "{{ mix_env }}"
+            DATABASE_URL: "{{ database_url }}"
+            SECRET_KEY_BASE: "{{ secret_key_base }}"
+          register: migrate_result
+          changed_when: "'migrated' in migrate_result.stdout"
+
+        - name: Create release
+          ansible.builtin.command:
+            cmd: "mix release --overwrite"
+            chdir: "{{ app_dir }}/source"
+          become_user: "{{ app_user }}"
+          environment:
+            HOME: "/home/{{ app_user }}"
+            MIX_ENV: "{{ mix_env }}"
+            DATABASE_URL: "{{ database_url }}"
+            SECRET_KEY_BASE: "{{ secret_key_base }}"
+            PHX_HOST: "{{ phx_host }}"
+            PHX_SERVER: "true"
+            PORT: "{{ app_port }}"
+            POOL_SIZE: "{{ pool_size }}"
+          changed_when: true
+          notify: Restart phoenix
+
+    # ------------------------------------------------------------------
+    # Systemd Service Configuration
+    # ------------------------------------------------------------------
+    - name: Configure systemd service
+      tags:
+        - service
+        - phoenix
+      block:
+        - name: Deploy Phoenix systemd service unit
+          ansible.builtin.template:
+            src: "templates/phoenix.service.j2"
+            dest: "/etc/systemd/system/{{ app_name }}.service"
+            owner: root
+            group: root
+            mode: "0644"
+          notify:
+            - Reload systemd
+            - Restart phoenix
+
+        - name: Ensure Phoenix service is enabled and running
+          ansible.builtin.systemd:
+            name: "{{ app_name }}"
+            state: started
+            enabled: true
+            daemon_reload: true
+
+    # ------------------------------------------------------------------
+    # Nginx Reverse Proxy
+    # ------------------------------------------------------------------
+    - name: Configure Nginx reverse proxy
+      tags:
+        - nginx
+        - config
+      block:
+        - name: Install Nginx
+          ansible.builtin.apt:
+            name: nginx
+            state: present
+
+        - name: Remove default Nginx site
+          ansible.builtin.file:
+            path: "/etc/nginx/sites-enabled/default"
+            state: absent
+          notify: Reload nginx
+
+        - name: Deploy Phoenix Nginx configuration
+          ansible.builtin.template:
+            src: "templates/phoenix_nginx.conf.j2"
+            dest: "/etc/nginx/sites-available/{{ app_name }}.conf"
+            owner: root
+            group: root
+            mode: "0644"
+          notify: Reload nginx
+
+        - name: Enable Phoenix Nginx virtual host
+          ansible.builtin.file:
+            src: "/etc/nginx/sites-available/{{ app_name }}.conf"
+            dest: "/etc/nginx/sites-enabled/{{ app_name }}.conf"
+            state: link
+          notify: Reload nginx
+
+        - name: Validate Nginx configuration
+          ansible.builtin.command:
+            cmd: "nginx -t"
+          changed_when: false
+
+        - name: Ensure Nginx is enabled and running
+          ansible.builtin.systemd:
+            name: nginx
+            state: started
+            enabled: true
+
+    # ------------------------------------------------------------------
+    # Health Check
+    # ------------------------------------------------------------------
+    - name: Verify Phoenix application health
+      tags:
+        - verify
+      block:
+        - name: Wait for Phoenix to start listening
+          ansible.builtin.wait_for:
+            port: "{{ app_port }}"
+            host: "127.0.0.1"
+            delay: 5
+            timeout: 60
+
+        - name: Check application health endpoint
+          ansible.builtin.uri:
+            url: "http://127.0.0.1:{{ app_port }}"
+            status_code:
+              - 200
+              - 301
+              - 302
+            timeout: 10
+          register: health_check
+          retries: 5
+          delay: 5
+          until: health_check is succeeded
+
+        - name: Display deployment success
+          ansible.builtin.debug:
+            msg: "Phoenix application '{{ app_name }}' deployed successfully on port {{ app_port }}"

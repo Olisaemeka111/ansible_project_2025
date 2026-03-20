@@ -1,0 +1,90 @@
+# {{ ansible_managed }}
+# Nginx Load Balancer Configuration
+# Generated for: {{ upstream_name }}
+
+upstream {{ upstream_name }} {
+{% if lb_algorithm | default('round_robin') == 'least_conn' %}
+    least_conn;
+{% elif lb_algorithm | default('round_robin') == 'ip_hash' %}
+    ip_hash;
+{% endif %}
+    # round_robin is the default and needs no directive
+
+    # Keepalive connections to backend servers
+    keepalive 32;
+
+{% for server in backend_servers %}
+    server {{ server.host }}:{{ server.port }}
+        weight={{ server.weight | default(1) }}
+        max_fails={{ server.max_fails | default(3) }}
+        fail_timeout={{ server.fail_timeout | default('30s') }};
+{% endfor %}
+}
+
+server {
+    listen {{ lb_port }};
+    server_name {{ lb_server_name | default('_') }};
+
+    # Access and error logs
+    access_log {{ nginx_access_log | default('/var/log/nginx/lb_access.log') }} combined;
+    error_log {{ nginx_error_log | default('/var/log/nginx/lb_error.log') }} warn;
+
+    # Client settings
+    client_max_body_size {{ nginx_client_max_body_size | default('50m') }};
+    client_body_timeout 60s;
+    client_header_timeout 60s;
+
+    # Proxy to upstream backend pool
+    location / {
+        proxy_pass http://{{ upstream_name }};
+
+        # Proxy headers
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Port  $server_port;
+
+        # Connection settings
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+
+        # Timeouts
+        proxy_connect_timeout 10s;
+        proxy_send_timeout    60s;
+        proxy_read_timeout    60s;
+
+        # Buffering
+        proxy_buffering on;
+        proxy_buffer_size 4k;
+        proxy_buffers 8 4k;
+
+        # Retry on upstream failure
+        proxy_next_upstream error timeout http_502 http_503 http_504;
+        proxy_next_upstream_tries {{ backend_servers | length }};
+        proxy_next_upstream_timeout 30s;
+    }
+
+    # Health check endpoint for the load balancer itself
+    location /health {
+        access_log off;
+        return 200 '{"status":"ok","upstream":"{{ upstream_name }}"}';
+        add_header Content-Type application/json;
+    }
+
+    # Nginx status page (restrict in production)
+    location /nginx_status {
+        stub_status on;
+        access_log off;
+        allow 127.0.0.1;
+        allow ::1;
+        deny all;
+    }
+
+    # Deny access to hidden files
+    location ~ /\. {
+        deny all;
+        access_log off;
+        log_not_found off;
+    }
+}

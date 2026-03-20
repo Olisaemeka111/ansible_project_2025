@@ -1,0 +1,239 @@
+---
+# Playbook: Deploy React Static Application
+# Description: Installs Node.js 20.x, builds a React application, and serves
+#              the static output through Nginx with SPA routing support.
+# Requirements: Ubuntu 22.04 target hosts, git repo accessible from targets
+# Tags: react, frontend, deploy, static, nginx
+
+- name: Deploy React Static Application
+  hosts: all
+  become: true
+
+  vars:
+    app_name: "reactapp"
+    git_repo: ""
+    git_branch: "main"
+    server_name: "_"
+    api_proxy_url: ""
+    nodejs_version: "20"
+    web_root: "/var/www/{{ app_name }}"
+    build_dir: "/tmp/{{ app_name }}-build"
+    build_output_dir: "build"  # React CRA uses 'build', Vite uses 'dist'
+    node_env: "production"
+    nginx_client_max_body_size: "10m"
+
+  handlers:
+    - name: Reload nginx
+      ansible.builtin.systemd:
+        name: nginx
+        state: reloaded
+      listen: "reload nginx"
+
+    - name: Restart nginx
+      ansible.builtin.systemd:
+        name: nginx
+        state: restarted
+      listen: "restart nginx"
+
+  tasks:
+    # ------------------------------------------------------------------
+    # Node.js installation
+    # ------------------------------------------------------------------
+    - name: Install Node.js 20.x for building React application
+      tags:
+        - setup
+        - nodejs
+      block:
+        - name: Install prerequisites
+          ansible.builtin.apt:
+            name:
+              - ca-certificates
+              - curl
+              - gnupg
+              - git
+            state: present
+            update_cache: true
+
+        - name: Create keyrings directory
+          ansible.builtin.file:
+            path: /etc/apt/keyrings
+            state: directory
+            mode: "0755"
+
+        - name: Download NodeSource GPG key
+          ansible.builtin.get_url:
+            url: "https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key"
+            dest: /tmp/nodesource.gpg.key
+            mode: "0644"
+
+        - name: De-armor and install NodeSource GPG key
+          ansible.builtin.shell:
+            cmd: gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg < /tmp/nodesource.gpg.key
+            creates: /etc/apt/keyrings/nodesource.gpg
+
+        - name: Add NodeSource repository
+          ansible.builtin.apt_repository:
+            repo: "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_{{ nodejs_version }}.x nodistro main"
+            filename: nodesource
+            state: present
+
+        - name: Install Node.js
+          ansible.builtin.apt:
+            name: nodejs
+            state: present
+            update_cache: true
+
+    # ------------------------------------------------------------------
+    # Nginx installation
+    # ------------------------------------------------------------------
+    - name: Install Nginx
+      tags:
+        - setup
+        - nginx
+      ansible.builtin.apt:
+        name: nginx
+        state: present
+
+    # ------------------------------------------------------------------
+    # Build React application
+    # ------------------------------------------------------------------
+    - name: Build React application
+      tags:
+        - build
+        - deploy
+      block:
+        - name: Create build directory
+          ansible.builtin.file:
+            path: "{{ build_dir }}"
+            state: directory
+            mode: "0755"
+
+        - name: Clone application repository
+          ansible.builtin.git:
+            repo: "{{ git_repo }}"
+            dest: "{{ build_dir }}"
+            version: "{{ git_branch }}"
+            force: true
+
+        - name: Install Node.js dependencies
+          community.general.npm:
+            path: "{{ build_dir }}"
+            ci: true
+          environment:
+            NODE_ENV: development  # Need devDependencies for build
+
+        - name: Build React application for production
+          ansible.builtin.command:
+            cmd: npm run build
+            chdir: "{{ build_dir }}"
+          environment:
+            NODE_ENV: "{{ node_env }}"
+            CI: "true"
+          changed_when: true
+
+    # ------------------------------------------------------------------
+    # Deploy static files
+    # ------------------------------------------------------------------
+    - name: Deploy built assets to web root
+      tags:
+        - deploy
+      block:
+        - name: Create web root directory
+          ansible.builtin.file:
+            path: "{{ web_root }}"
+            state: directory
+            owner: www-data
+            group: www-data
+            mode: "0755"
+
+        - name: Synchronize build output to web root
+          ansible.posix.synchronize:
+            src: "{{ build_dir }}/{{ build_output_dir }}/"
+            dest: "{{ web_root }}/"
+            delete: true
+            recursive: true
+          delegate_to: "{{ inventory_hostname }}"
+          notify: "reload nginx"
+
+        - name: Set correct ownership on web root
+          ansible.builtin.file:
+            path: "{{ web_root }}"
+            owner: www-data
+            group: www-data
+            recurse: true
+
+        - name: Clean up build directory
+          ansible.builtin.file:
+            path: "{{ build_dir }}"
+            state: absent
+
+    # ------------------------------------------------------------------
+    # Nginx configuration
+    # ------------------------------------------------------------------
+    - name: Configure Nginx for React SPA
+      tags:
+        - nginx
+        - config
+      block:
+        - name: Remove default nginx site
+          ansible.builtin.file:
+            path: /etc/nginx/sites-enabled/default
+            state: absent
+          notify: "reload nginx"
+
+        - name: Deploy Nginx configuration for React SPA
+          ansible.builtin.template:
+            src: react_nginx.conf.j2
+            dest: "/etc/nginx/sites-available/{{ app_name }}.conf"
+            owner: root
+            group: root
+            mode: "0644"
+          notify: "reload nginx"
+
+        - name: Enable Nginx site configuration
+          ansible.builtin.file:
+            src: "/etc/nginx/sites-available/{{ app_name }}.conf"
+            dest: "/etc/nginx/sites-enabled/{{ app_name }}.conf"
+            state: link
+          notify: "reload nginx"
+
+        - name: Validate Nginx configuration
+          ansible.builtin.command:
+            cmd: nginx -t
+          changed_when: false
+
+        - name: Ensure Nginx is enabled and running
+          ansible.builtin.systemd:
+            name: nginx
+            enabled: true
+            state: started
+
+    # ------------------------------------------------------------------
+    # Verification
+    # ------------------------------------------------------------------
+    - name: Verify React deployment
+      tags:
+        - verify
+      block:
+        - name: Wait for Nginx to serve the application
+          ansible.builtin.uri:
+            url: "http://localhost/"
+            method: GET
+            status_code:
+              - 200
+          register: health_check
+          retries: 5
+          delay: 2
+          until: health_check is not failed
+
+        - name: Verify index.html exists in web root
+          ansible.builtin.stat:
+            path: "{{ web_root }}/index.html"
+          register: index_file
+
+        - name: Assert index.html is present
+          ansible.builtin.assert:
+            that:
+              - index_file.stat.exists
+            fail_msg: "index.html not found in {{ web_root }}"
+            success_msg: "{{ app_name }} (React) deployed successfully and served by Nginx"

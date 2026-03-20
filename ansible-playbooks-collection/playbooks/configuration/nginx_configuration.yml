@@ -1,0 +1,114 @@
+---
+# Ansible Playbook: Nginx Web Server Configuration
+# Installs and configures Nginx with a customizable virtual host.
+# Usage: ansible-playbook nginx_configuration.yml --limit webservers
+
+- name: Install and configure Nginx web server
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    nginx_server_name: "example.com"
+    nginx_document_root: "/var/www/html"
+    nginx_listen_port: 80
+    nginx_worker_processes: "auto"
+    nginx_worker_connections: 1024
+    nginx_remove_default_site: true
+    nginx_sites:
+      - server_name: "{{ nginx_server_name }}"
+        document_root: "{{ nginx_document_root }}"
+        listen_port: "{{ nginx_listen_port }}"
+
+  handlers:
+    - name: Test nginx configuration
+      ansible.builtin.command:
+        cmd: nginx -t
+      changed_when: false
+      listen: "reload nginx"
+
+    - name: Reload nginx service
+      ansible.builtin.systemd:
+        name: nginx
+        state: reloaded
+      listen: "reload nginx"
+
+    - name: Restart nginx service
+      ansible.builtin.systemd:
+        name: nginx
+        state: restarted
+
+  tasks:
+    - name: Install Nginx
+      tags: [install]
+      block:
+        - name: Update apt cache
+          ansible.builtin.apt:
+            update_cache: true
+            cache_valid_time: 3600
+
+        - name: Install nginx package
+          ansible.builtin.apt:
+            name: nginx
+            state: present
+
+    - name: Configure Nginx
+      tags: [configure]
+      block:
+        - name: Create document root directory
+          ansible.builtin.file:
+            path: "{{ item.document_root }}"
+            state: directory
+            owner: www-data
+            group: www-data
+            mode: "0755"
+          loop: "{{ nginx_sites }}"
+          loop_control:
+            label: "{{ item.document_root }}"
+
+        - name: Deploy nginx virtual host configuration
+          ansible.builtin.template:
+            src: templates/nginx.conf.j2
+            dest: "/etc/nginx/sites-available/{{ item.server_name }}"
+            owner: root
+            group: root
+            mode: "0644"
+            validate: "bash -c 'nginx -t -c /dev/stdin <<< \"events {} http { include %s; }\"' || true"
+          loop: "{{ nginx_sites }}"
+          loop_control:
+            label: "{{ item.server_name }}"
+          notify: "reload nginx"
+
+        - name: Enable site with symlink
+          ansible.builtin.file:
+            src: "/etc/nginx/sites-available/{{ item.server_name }}"
+            dest: "/etc/nginx/sites-enabled/{{ item.server_name }}"
+            state: link
+          loop: "{{ nginx_sites }}"
+          loop_control:
+            label: "{{ item.server_name }}"
+          notify: "reload nginx"
+
+        - name: Remove default site if custom site is provided
+          ansible.builtin.file:
+            path: /etc/nginx/sites-enabled/default
+            state: absent
+          when: nginx_remove_default_site | bool
+          notify: "reload nginx"
+
+    - name: Start and enable Nginx service
+      tags: [service]
+      ansible.builtin.systemd:
+        name: nginx
+        state: started
+        enabled: true
+
+    - name: Verify Nginx is running
+      tags: [verify]
+      ansible.builtin.uri:
+        url: "http://localhost:{{ nginx_listen_port }}"
+        status_code: [200, 301, 302, 403]
+      register: nginx_health
+      retries: 3
+      delay: 5
+      until: nginx_health is not failed

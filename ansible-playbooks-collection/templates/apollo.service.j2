@@ -1,0 +1,39 @@
+[Unit]
+Description={{ app_name }} Apollo GraphQL Server
+After=network.target
+
+[Service]
+Type=simple
+User={{ app_user | default(app_name) }}
+Group={{ app_user | default(app_name) }}
+WorkingDirectory={{ app_dir }}
+ExecStart=/usr/bin/node {{ app_dir }}/server.js
+Restart=always
+RestartSec=10
+
+# Apollo Server environment
+Environment="NODE_ENV={{ node_env | default('production') }}"
+Environment="PORT={{ app_port | default(4000) }}"
+{% if cors_origin is defined %}
+Environment="CORS_ORIGIN={{ cors_origin }}"
+{% endif %}
+{% if database_url is defined %}
+Environment="DATABASE_URL={{ database_url }}"
+{% endif %}
+{% if redis_url is defined %}
+Environment="REDIS_URL={{ redis_url }}"
+{% endif %}
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier={{ app_name }}
+
+# Security
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

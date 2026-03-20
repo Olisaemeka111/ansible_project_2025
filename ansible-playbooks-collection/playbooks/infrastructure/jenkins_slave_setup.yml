@@ -1,0 +1,336 @@
+---
+# Playbook: Set Up Jenkins Agent Nodes
+# Description: Configures remote hosts as Jenkins agent (slave) nodes with
+#              Java 17, Docker, build tools, and a systemd-managed agent service.
+# Requirements:
+#   - Target hosts running Ubuntu 22.04
+#   - SSH access with sudo privileges
+#   - Jenkins master accessible from agent nodes
+#   - Template file: templates/jenkins_slave.service.j2
+# Usage:
+#   ansible-playbook jenkins_slave_setup.yml -i inventory/hosts \
+#     -e "jenkins_master_url=https://jenkins.example.com agent_name=agent-01 agent_secret=abc123"
+#   ansible-playbook jenkins_slave_setup.yml --tags install
+
+- name: Set Up Jenkins Agent Nodes
+  hosts: jenkins_agents
+  become: true
+  gather_facts: true
+
+  vars:
+    # Jenkins master connection
+    jenkins_master_url: "https://jenkins.example.com"
+    agent_name: "jenkins-agent-{{ inventory_hostname_short }}"
+    agent_secret: ""
+    jenkins_agent_jar_url: "{{ jenkins_master_url }}/jnlpJars/agent.jar"
+
+    # Jenkins user
+    jenkins_user: "jenkins"
+    jenkins_group: "jenkins"
+    jenkins_home: "/var/lib/jenkins"
+    jenkins_workspace: "/var/lib/jenkins/workspace"
+
+    # Java
+    java_package: "openjdk-17-jdk"
+
+    # Build tools
+    maven_version: "3.9.9"
+    gradle_version: "8.12"
+    maven_install_dir: "/opt/maven"
+    gradle_install_dir: "/opt/gradle"
+
+    # Docker
+    install_docker: true
+    docker_edition: "ce"
+
+    # Packages
+    base_packages:
+      - git
+      - curl
+      - wget
+      - unzip
+      - apt-transport-https
+      - ca-certificates
+      - gnupg
+      - lsb-release
+      - jq
+      - tree
+
+  handlers:
+    - name: Restart jenkins-agent
+      ansible.builtin.systemd:
+        name: jenkins-agent
+        state: restarted
+        daemon_reload: true
+
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # Validation
+    # -------------------------------------------------------------------------
+    - name: Validate required variables
+      ansible.builtin.assert:
+        that:
+          - jenkins_master_url | length > 0
+          - agent_name | length > 0
+          - agent_secret | length > 0
+        fail_msg: >-
+          Required: jenkins_master_url, agent_name, agent_secret.
+        success_msg: "All required variables are set."
+      tags:
+        - validate
+
+    # -------------------------------------------------------------------------
+    # System Preparation
+    # -------------------------------------------------------------------------
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+      tags:
+        - install
+        - packages
+
+    - name: Install base packages
+      ansible.builtin.apt:
+        name: "{{ base_packages }}"
+        state: present
+      tags:
+        - install
+        - packages
+
+    # -------------------------------------------------------------------------
+    # Java 17
+    # -------------------------------------------------------------------------
+    - name: Install Java 17
+      ansible.builtin.apt:
+        name: "{{ java_package }}"
+        state: present
+      tags:
+        - install
+        - java
+
+    - name: Verify Java installation
+      ansible.builtin.command:
+        cmd: java -version
+      register: java_version_output
+      changed_when: false
+      tags:
+        - install
+        - java
+        - verify
+
+    # -------------------------------------------------------------------------
+    # Jenkins User
+    # -------------------------------------------------------------------------
+    - name: Create jenkins group
+      ansible.builtin.group:
+        name: "{{ jenkins_group }}"
+        state: present
+        system: true
+      tags:
+        - user
+
+    - name: Create jenkins user
+      ansible.builtin.user:
+        name: "{{ jenkins_user }}"
+        group: "{{ jenkins_group }}"
+        home: "{{ jenkins_home }}"
+        shell: /bin/bash
+        system: true
+        create_home: true
+        state: present
+      tags:
+        - user
+
+    - name: Create workspace directory
+      ansible.builtin.file:
+        path: "{{ jenkins_workspace }}"
+        state: directory
+        owner: "{{ jenkins_user }}"
+        group: "{{ jenkins_group }}"
+        mode: "0755"
+      tags:
+        - user
+        - workspace
+
+    # -------------------------------------------------------------------------
+    # Docker Installation
+    # -------------------------------------------------------------------------
+    - name: Install Docker
+      when: install_docker | bool
+      tags:
+        - install
+        - docker
+      block:
+        - name: Add Docker GPG key
+          ansible.builtin.apt_key:
+            url: "https://download.docker.com/linux/ubuntu/gpg"
+            keyring: /usr/share/keyrings/docker-archive-keyring.gpg
+            state: present
+
+        - name: Add Docker repository
+          ansible.builtin.apt_repository:
+            repo: >-
+              deb [arch=amd64 signed-by=/usr/share/keyrings/docker-archive-keyring.gpg]
+              https://download.docker.com/linux/ubuntu
+              {{ ansible_distribution_release }} stable
+            filename: docker
+            state: present
+
+        - name: Install Docker packages
+          ansible.builtin.apt:
+            name:
+              - "docker-{{ docker_edition }}"
+              - "docker-{{ docker_edition }}-cli"
+              - containerd.io
+              - docker-buildx-plugin
+              - docker-compose-plugin
+            state: present
+            update_cache: true
+
+        - name: Add jenkins user to docker group
+          ansible.builtin.user:
+            name: "{{ jenkins_user }}"
+            groups: docker
+            append: true
+
+        - name: Ensure Docker service is started and enabled
+          ansible.builtin.systemd:
+            name: docker
+            state: started
+            enabled: true
+
+    # -------------------------------------------------------------------------
+    # Maven
+    # -------------------------------------------------------------------------
+    - name: Install Maven
+      tags:
+        - install
+        - maven
+      block:
+        - name: Create Maven install directory
+          ansible.builtin.file:
+            path: "{{ maven_install_dir }}"
+            state: directory
+            mode: "0755"
+
+        - name: Download and extract Maven
+          ansible.builtin.unarchive:
+            src: "https://archive.apache.org/dist/maven/maven-3/{{ maven_version }}/binaries/apache-maven-{{ maven_version }}-bin.tar.gz"
+            dest: "{{ maven_install_dir }}"
+            remote_src: true
+            creates: "{{ maven_install_dir }}/apache-maven-{{ maven_version }}"
+
+        - name: Create Maven symlinks
+          ansible.builtin.file:
+            src: "{{ maven_install_dir }}/apache-maven-{{ maven_version }}/bin/{{ item }}"
+            dest: "/usr/local/bin/{{ item }}"
+            state: link
+            force: true
+          loop:
+            - mvn
+            - mvnDebug
+
+    # -------------------------------------------------------------------------
+    # Gradle
+    # -------------------------------------------------------------------------
+    - name: Install Gradle
+      tags:
+        - install
+        - gradle
+      block:
+        - name: Create Gradle install directory
+          ansible.builtin.file:
+            path: "{{ gradle_install_dir }}"
+            state: directory
+            mode: "0755"
+
+        - name: Download and extract Gradle
+          ansible.builtin.unarchive:
+            src: "https://services.gradle.org/distributions/gradle-{{ gradle_version }}-bin.zip"
+            dest: "{{ gradle_install_dir }}"
+            remote_src: true
+            creates: "{{ gradle_install_dir }}/gradle-{{ gradle_version }}"
+
+        - name: Create Gradle symlink
+          ansible.builtin.file:
+            src: "{{ gradle_install_dir }}/gradle-{{ gradle_version }}/bin/gradle"
+            dest: "/usr/local/bin/gradle"
+            state: link
+            force: true
+
+    # -------------------------------------------------------------------------
+    # Jenkins Agent JAR
+    # -------------------------------------------------------------------------
+    - name: Download Jenkins agent.jar from master
+      ansible.builtin.get_url:
+        url: "{{ jenkins_agent_jar_url }}"
+        dest: "{{ jenkins_home }}/agent.jar"
+        owner: "{{ jenkins_user }}"
+        group: "{{ jenkins_group }}"
+        mode: "0644"
+        force: true
+      tags:
+        - agent
+        - install
+
+    # -------------------------------------------------------------------------
+    # Systemd Service
+    # -------------------------------------------------------------------------
+    - name: Deploy Jenkins agent systemd service
+      ansible.builtin.template:
+        src: jenkins_slave.service.j2
+        dest: /etc/systemd/system/jenkins-agent.service
+        owner: root
+        group: root
+        mode: "0644"
+      notify:
+        - Reload systemd
+        - Restart jenkins-agent
+      tags:
+        - agent
+        - service
+
+    - name: Ensure Jenkins agent service is started and enabled
+      ansible.builtin.systemd:
+        name: jenkins-agent
+        state: started
+        enabled: true
+        daemon_reload: true
+      tags:
+        - agent
+        - service
+
+    # -------------------------------------------------------------------------
+    # Verification
+    # -------------------------------------------------------------------------
+    - name: Verify installed tool versions
+      ansible.builtin.command:
+        cmd: "{{ item.cmd }}"
+      loop:
+        - { name: "Java", cmd: "java -version" }
+        - { name: "Git", cmd: "git --version" }
+        - { name: "Maven", cmd: "mvn --version" }
+        - { name: "Gradle", cmd: "gradle --version" }
+        - { name: "Docker", cmd: "docker --version" }
+      loop_control:
+        label: "{{ item.name }}"
+      register: tool_versions
+      changed_when: false
+      ignore_errors: true
+      tags:
+        - verify
+
+    - name: Display Jenkins agent status
+      ansible.builtin.debug:
+        msg:
+          - "Jenkins Agent '{{ agent_name }}' configured on {{ inventory_hostname }}"
+          - "Jenkins Master: {{ jenkins_master_url }}"
+          - "Workspace: {{ jenkins_workspace }}"
+          - "Service: jenkins-agent.service"
+      tags:
+        - verify

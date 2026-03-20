@@ -1,0 +1,106 @@
+# Ansible managed - Systemd service unit for Flask application (Gunicorn)
+# Template: flask.service.j2
+#
+# Variables:
+#   app_name          - Application name (default: flask-app)
+#   app_dir           - Application directory (default: /opt/{{ app_name }})
+#   app_user          - User to run the service (default: www-data)
+#   app_group         - Group to run the service (default: www-data)
+#   app_port          - Application port (default: 5000)
+#   gunicorn_workers  - Number of Gunicorn worker processes (default: 4)
+#   gunicorn_threads  - Threads per worker (default: 2)
+#   gunicorn_timeout  - Worker timeout in seconds (default: 120)
+#   gunicorn_bin      - Path to gunicorn binary (default: {{ venv_dir }}/bin/gunicorn)
+#   venv_dir          - Virtualenv directory (default: {{ app_dir }}/venv)
+#   wsgi_module       - WSGI module:application (default: wsgi:app)
+#   flask_env         - Flask environment (default: production)
+#   flask_extra_env   - Dict of additional environment variables (optional)
+
+[Unit]
+Description={{ app_name | default('flask-app') }} Flask Application (Gunicorn)
+Documentation=https://docs.gunicorn.org/
+After=network.target
+{% if requires_redis | default(false) %}
+After=redis.service
+{% endif %}
+{% if requires_postgresql | default(false) %}
+After=postgresql.service
+{% endif %}
+{% if requires_mysql | default(false) %}
+After=mysql.service
+{% endif %}
+Wants=network-online.target
+
+[Service]
+Type=notify
+NotifyAccess=all
+
+# User and group
+User={{ app_user | default('www-data') }}
+Group={{ app_group | default('www-data') }}
+
+# Working directory
+WorkingDirectory={{ app_dir | default('/opt/' + app_name) }}
+
+# Environment variables
+Environment=FLASK_ENV={{ flask_env | default('production') }}
+Environment=FLASK_APP={{ flask_app | default('app') }}
+Environment=PORT={{ app_port | default(5000) }}
+{% if flask_secret_key is defined %}
+Environment=SECRET_KEY={{ flask_secret_key }}
+{% endif %}
+{% if database_url is defined %}
+Environment=DATABASE_URL={{ database_url }}
+{% endif %}
+{% if flask_extra_env is defined %}
+{% for key, value in flask_extra_env.items() %}
+Environment={{ key }}={{ value }}
+{% endfor %}
+{% endif %}
+
+# Gunicorn start command
+# --workers: number of worker processes (recommended: 2 * CPU cores + 1)
+# --threads: threads per worker for handling concurrent requests
+# --bind: address and port to listen on
+# --access-logfile: access log location (- for stdout)
+# --error-logfile: error log location (- for stderr)
+ExecStart={{ gunicorn_bin | default((venv_dir | default(app_dir | default('/opt/' + app_name) + '/venv')) + '/bin/gunicorn') }} \
+    --workers {{ gunicorn_workers | default(4) }} \
+    --threads {{ gunicorn_threads | default(2) }} \
+    --bind 0.0.0.0:{{ app_port | default(5000) }} \
+    --timeout {{ gunicorn_timeout | default(120) }} \
+    --access-logfile {{ gunicorn_access_log | default('-') }} \
+    --error-logfile {{ gunicorn_error_log | default('-') }} \
+{% if gunicorn_max_requests | default(0) > 0 %}
+    --max-requests {{ gunicorn_max_requests }} \
+    --max-requests-jitter {{ gunicorn_max_requests_jitter | default(50) }} \
+{% endif %}
+    {{ wsgi_module | default('wsgi:app') }}
+
+# Reload command for graceful reload
+ExecReload=/bin/kill -s HUP $MAINPID
+
+# Restart policy
+Restart=always
+RestartSec=10
+
+# Graceful shutdown timeout
+TimeoutStopSec=30
+KillMode=mixed
+
+# Standard output and error
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier={{ app_name | default('flask-app') }}
+
+# File descriptor limit
+LimitNOFILE={{ nofile_limit | default(65536) }}
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,269 @@
+---
+# Playbook: Provision Azure Virtual Machines
+# Description: Creates a complete Azure VM deployment including resource group,
+#              virtual network, subnet, public IP, NIC, and the VM itself.
+# Requirements:
+#   - ansible-galaxy collection install azure.azcollection
+#   - pip install azure-identity azure-mgmt-compute azure-mgmt-network azure-mgmt-resource
+#   - Azure credentials (service principal, managed identity, or CLI auth)
+# Usage:
+#   ansible-playbook azure_provisioning.yml -e "admin_username=azureuser"
+#   ansible-playbook azure_provisioning.yml --tags vm
+
+- name: Provision Azure Virtual Machines
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    # Resource naming
+    resource_group_name: "ansible-managed-rg"
+    location: "eastus2"
+    vm_name: "ansible-managed-vm"
+    project_name: "infrastructure"
+    environment: "development"
+
+    # Networking
+    vnet_name: "{{ vm_name }}-vnet"
+    vnet_cidr: "10.10.0.0/16"
+    subnet_name: "{{ vm_name }}-subnet"
+    subnet_cidr: "10.10.1.0/24"
+    public_ip_name: "{{ vm_name }}-pip"
+    nsg_name: "{{ vm_name }}-nsg"
+    nic_name: "{{ vm_name }}-nic"
+
+    # VM configuration
+    vm_size: "Standard_B2s"
+    admin_username: "azureuser"
+    ssh_public_key: ""
+    os_disk_size_gb: 30
+    os_disk_type: "Premium_LRS"
+
+    # Ubuntu 22.04 LTS image
+    image:
+      publisher: "Canonical"
+      offer: "0001-com-ubuntu-server-jammy"
+      sku: "22_04-lts-gen2"
+      version: "latest"
+
+    common_tags:
+      Project: "{{ project_name }}"
+      Environment: "{{ environment }}"
+      ManagedBy: "ansible"
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # Validation
+    # -------------------------------------------------------------------------
+    - name: Validate required variables
+      ansible.builtin.assert:
+        that:
+          - ssh_public_key | length > 0 or admin_password is defined
+        fail_msg: >-
+          Either ssh_public_key or admin_password must be provided.
+          Example: -e "ssh_public_key='ssh-rsa AAAA...'"
+        success_msg: "Authentication credentials are set."
+      tags:
+        - validate
+        - vm
+
+    # -------------------------------------------------------------------------
+    # Resource Group
+    # -------------------------------------------------------------------------
+    - name: Create resource group
+      azure.azcollection.azure_rm_resourcegroup:
+        name: "{{ resource_group_name }}"
+        location: "{{ location }}"
+        tags: "{{ common_tags }}"
+        state: present
+      register: rg_result
+      tags:
+        - resourcegroup
+        - network
+        - vm
+
+    # -------------------------------------------------------------------------
+    # Networking
+    # -------------------------------------------------------------------------
+    - name: Create virtual network
+      azure.azcollection.azure_rm_virtualnetwork:
+        resource_group: "{{ resource_group_name }}"
+        name: "{{ vnet_name }}"
+        address_prefixes_cidr:
+          - "{{ vnet_cidr }}"
+        location: "{{ location }}"
+        tags: "{{ common_tags }}"
+        state: present
+      register: vnet_result
+      tags:
+        - network
+        - vm
+
+    - name: Create subnet
+      azure.azcollection.azure_rm_subnet:
+        resource_group: "{{ resource_group_name }}"
+        virtual_network_name: "{{ vnet_name }}"
+        name: "{{ subnet_name }}"
+        address_prefix_cidr: "{{ subnet_cidr }}"
+        state: present
+      register: subnet_result
+      tags:
+        - network
+        - vm
+
+    - name: Create public IP address
+      azure.azcollection.azure_rm_publicipaddress:
+        resource_group: "{{ resource_group_name }}"
+        name: "{{ public_ip_name }}"
+        allocation_method: "Static"
+        sku: "Standard"
+        location: "{{ location }}"
+        tags: "{{ common_tags }}"
+        state: present
+      register: pip_result
+      tags:
+        - network
+        - vm
+
+    - name: Create Network Security Group with SSH rule
+      azure.azcollection.azure_rm_securitygroup:
+        resource_group: "{{ resource_group_name }}"
+        name: "{{ nsg_name }}"
+        location: "{{ location }}"
+        rules:
+          - name: "AllowSSH"
+            protocol: "Tcp"
+            destination_port_range: "22"
+            access: "Allow"
+            priority: 1000
+            direction: "Inbound"
+            source_address_prefix: "*"
+          - name: "AllowHTTP"
+            protocol: "Tcp"
+            destination_port_range: "80"
+            access: "Allow"
+            priority: 1010
+            direction: "Inbound"
+            source_address_prefix: "*"
+          - name: "AllowHTTPS"
+            protocol: "Tcp"
+            destination_port_range: "443"
+            access: "Allow"
+            priority: 1020
+            direction: "Inbound"
+            source_address_prefix: "*"
+        tags: "{{ common_tags }}"
+        state: present
+      register: nsg_result
+      tags:
+        - network
+        - vm
+
+    - name: Create network interface
+      azure.azcollection.azure_rm_networkinterface:
+        resource_group: "{{ resource_group_name }}"
+        name: "{{ nic_name }}"
+        virtual_network: "{{ vnet_name }}"
+        subnet_name: "{{ subnet_name }}"
+        security_group: "{{ nsg_name }}"
+        ip_configurations:
+          - name: "ipconfig1"
+            public_ip_address_name: "{{ public_ip_name }}"
+            primary: true
+        location: "{{ location }}"
+        tags: "{{ common_tags }}"
+        state: present
+      register: nic_result
+      tags:
+        - network
+        - vm
+
+    # -------------------------------------------------------------------------
+    # Virtual Machine
+    # -------------------------------------------------------------------------
+    - name: Create virtual machine with SSH key authentication
+      azure.azcollection.azure_rm_virtualmachine:
+        resource_group: "{{ resource_group_name }}"
+        name: "{{ vm_name }}"
+        vm_size: "{{ vm_size }}"
+        location: "{{ location }}"
+        admin_username: "{{ admin_username }}"
+        ssh_password_enabled: false
+        ssh_public_keys:
+          - path: "/home/{{ admin_username }}/.ssh/authorized_keys"
+            key_data: "{{ ssh_public_key }}"
+        network_interfaces:
+          - "{{ nic_name }}"
+        image: "{{ image }}"
+        os_disk_size_gb: "{{ os_disk_size_gb }}"
+        managed_disk_type: "{{ os_disk_type }}"
+        os_type: "Linux"
+        tags: "{{ common_tags | combine({'Name': vm_name}) }}"
+        state: present
+      when: ssh_public_key | length > 0
+      register: vm_result_ssh
+      tags:
+        - vm
+
+    - name: Create virtual machine with password authentication
+      azure.azcollection.azure_rm_virtualmachine:
+        resource_group: "{{ resource_group_name }}"
+        name: "{{ vm_name }}"
+        vm_size: "{{ vm_size }}"
+        location: "{{ location }}"
+        admin_username: "{{ admin_username }}"
+        admin_password: "{{ admin_password }}"
+        ssh_password_enabled: true
+        network_interfaces:
+          - "{{ nic_name }}"
+        image: "{{ image }}"
+        os_disk_size_gb: "{{ os_disk_size_gb }}"
+        managed_disk_type: "{{ os_disk_type }}"
+        os_type: "Linux"
+        tags: "{{ common_tags | combine({'Name': vm_name}) }}"
+        state: present
+      when:
+        - ssh_public_key | length == 0
+        - admin_password is defined
+      register: vm_result_pw
+      tags:
+        - vm
+
+    - name: Set VM result fact
+      ansible.builtin.set_fact:
+        vm_result: "{{ vm_result_ssh if (ssh_public_key | length > 0) else vm_result_pw }}"
+      tags:
+        - vm
+        - verify
+
+    # -------------------------------------------------------------------------
+    # Connection Info
+    # -------------------------------------------------------------------------
+    - name: Retrieve public IP details
+      azure.azcollection.azure_rm_publicipaddress_info:
+        resource_group: "{{ resource_group_name }}"
+        name: "{{ public_ip_name }}"
+      register: pip_info
+      tags:
+        - vm
+        - verify
+
+    - name: Display connection information
+      ansible.builtin.debug:
+        msg:
+          - "============================================="
+          - "  Azure VM - Connection Information"
+          - "============================================="
+          - "Resource Group:  {{ resource_group_name }}"
+          - "VM Name:         {{ vm_name }}"
+          - "VM Size:         {{ vm_size }}"
+          - "Location:        {{ location }}"
+          - "Public IP:       {{ pip_info.publicipaddresses[0].ip_address | default('N/A') }}"
+          - "Admin User:      {{ admin_username }}"
+          - ""
+          - "SSH Command:"
+          - "  ssh {{ admin_username }}@{{ pip_info.publicipaddresses[0].ip_address | default('N/A') }}"
+          - "============================================="
+      tags:
+        - vm
+        - verify

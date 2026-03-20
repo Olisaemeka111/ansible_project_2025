@@ -1,0 +1,74 @@
+# Ansible managed - Systemd service unit for Node.js application
+# Template: nodejs.service.j2
+#
+# Variables:
+#   app_name       - Application name (used for description and identification)
+#   app_dir        - Application working directory (default: /opt/{{ app_name }})
+#   app_user       - User to run the service as (default: nodejs)
+#   app_group      - Group to run the service as (default: {{ app_user }})
+#   app_port       - Application port (default: 3000)
+#   node_env       - NODE_ENV value (default: production)
+#   node_bin       - Path to node binary (default: /usr/bin/node)
+#   app_entry      - Application entry point (default: app.js)
+#   node_extra_env - Dict of additional environment variables (optional)
+
+[Unit]
+Description={{ app_name | default('nodejs-app') }} Node.js Application
+Documentation=https://nodejs.org/
+After=network.target
+{% if requires_mongodb | default(false) %}
+After=mongod.service
+{% endif %}
+{% if requires_redis | default(false) %}
+After=redis.service
+{% endif %}
+{% if requires_postgresql | default(false) %}
+After=postgresql.service
+{% endif %}
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# User and group
+User={{ app_user | default('nodejs') }}
+Group={{ app_group | default(app_user | default('nodejs')) }}
+
+# Working directory
+WorkingDirectory={{ app_dir | default('/opt/' + app_name) }}
+
+# Application start command
+ExecStart={{ node_bin | default('/usr/bin/node') }} {{ app_entry | default('app.js') }}
+
+# Environment variables
+Environment=NODE_ENV={{ node_env | default('production') }}
+Environment=PORT={{ app_port | default(3000) }}
+{% if node_extra_env is defined %}
+{% for key, value in node_extra_env.items() %}
+Environment={{ key }}={{ value }}
+{% endfor %}
+{% endif %}
+
+# Restart policy - always restart on failure
+Restart=always
+RestartSec=10
+
+# Process limits
+LimitNOFILE={{ node_nofile_limit | default(65536) }}
+
+# Standard output and error logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier={{ app_name | default('nodejs-app') }}
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+# Graceful shutdown timeout (SIGTERM then SIGKILL)
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

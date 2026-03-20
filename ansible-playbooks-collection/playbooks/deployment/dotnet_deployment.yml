@@ -1,0 +1,259 @@
+---
+# Playbook: Deploy .NET Application
+# Description: Installs .NET 8.0 runtime from Microsoft packages repository,
+#              deploys published application files, and sets up Nginx reverse proxy.
+# Requirements: Ubuntu 22.04 target hosts, published .NET application available
+# Tags: dotnet, csharp, deploy, application
+
+- name: Deploy .NET Application
+  hosts: all
+  become: true
+
+  vars:
+    app_name: "dotnetapp"
+    app_dir: "/opt/{{ app_name }}"
+    app_port: 5000
+    app_user: "dotnetapp"
+    app_dll: "{{ app_name }}.dll"
+    dotnet_environment: "Production"
+    app_source: ""
+    server_name: "_"
+    log_dir: "/var/log/{{ app_name }}"
+    dotnet_version: "8.0"
+    aspnetcore_urls: "http://localhost:{{ app_port }}"
+
+  handlers:
+    - name: Restart {{ app_name }}
+      ansible.builtin.systemd:
+        name: "{{ app_name }}"
+        state: restarted
+        daemon_reload: true
+      listen: "restart app"
+
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+      listen: "reload systemd"
+
+    - name: Reload nginx
+      ansible.builtin.systemd:
+        name: nginx
+        state: reloaded
+      listen: "reload nginx"
+
+    - name: Restart nginx
+      ansible.builtin.systemd:
+        name: nginx
+        state: restarted
+      listen: "restart nginx"
+
+  tasks:
+    # ------------------------------------------------------------------
+    # .NET Runtime installation
+    # ------------------------------------------------------------------
+    - name: Install .NET 8.0 Runtime
+      tags:
+        - setup
+        - dotnet
+      block:
+        - name: Update apt cache
+          ansible.builtin.apt:
+            update_cache: true
+            cache_valid_time: 3600
+
+        - name: Install prerequisites
+          ansible.builtin.apt:
+            name:
+              - ca-certificates
+              - curl
+              - apt-transport-https
+            state: present
+
+        - name: Download Microsoft packages signing key
+          ansible.builtin.get_url:
+            url: "https://packages.microsoft.com/config/ubuntu/22.04/packages-microsoft-prod.deb"
+            dest: /tmp/packages-microsoft-prod.deb
+            mode: "0644"
+
+        - name: Install Microsoft packages repository
+          ansible.builtin.apt:
+            deb: /tmp/packages-microsoft-prod.deb
+            state: present
+
+        - name: Install ASP.NET Core Runtime
+          ansible.builtin.apt:
+            name:
+              - "aspnetcore-runtime-{{ dotnet_version }}"
+              - nginx
+            state: present
+            update_cache: true
+
+        - name: Verify dotnet installation
+          ansible.builtin.command:
+            cmd: dotnet --list-runtimes
+          register: dotnet_runtimes
+          changed_when: false
+
+        - name: Display installed .NET runtimes
+          ansible.builtin.debug:
+            msg: "{{ dotnet_runtimes.stdout_lines }}"
+
+    # ------------------------------------------------------------------
+    # Application user and directories
+    # ------------------------------------------------------------------
+    - name: Configure application user and directories
+      tags:
+        - setup
+        - user
+      block:
+        - name: Create application user
+          ansible.builtin.user:
+            name: "{{ app_user }}"
+            system: true
+            shell: /usr/sbin/nologin
+            home: "{{ app_dir }}"
+            create_home: false
+
+        - name: Create application and log directories
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: directory
+            owner: "{{ app_user }}"
+            group: "{{ app_user }}"
+            mode: "0755"
+          loop:
+            - "{{ app_dir }}"
+            - "{{ log_dir }}"
+
+    # ------------------------------------------------------------------
+    # Application deployment
+    # ------------------------------------------------------------------
+    - name: Deploy .NET application files
+      tags:
+        - deploy
+      block:
+        - name: Copy published application files to server
+          ansible.builtin.copy:
+            src: "{{ app_source }}/"
+            dest: "{{ app_dir }}/"
+            owner: "{{ app_user }}"
+            group: "{{ app_user }}"
+            mode: "0644"
+            directory_mode: "0755"
+          when: app_source is not match("^https?://")
+          notify: "restart app"
+
+        - name: Download application archive from URL
+          ansible.builtin.get_url:
+            url: "{{ app_source }}"
+            dest: "/tmp/{{ app_name }}.tar.gz"
+            mode: "0644"
+          when: app_source is match("^https?://")
+
+        - name: Extract application archive
+          ansible.builtin.unarchive:
+            src: "/tmp/{{ app_name }}.tar.gz"
+            dest: "{{ app_dir }}"
+            remote_src: true
+            owner: "{{ app_user }}"
+            group: "{{ app_user }}"
+          when: app_source is match("^https?://")
+          notify: "restart app"
+
+        - name: Ensure DLL has correct ownership
+          ansible.builtin.file:
+            path: "{{ app_dir }}/{{ app_dll }}"
+            owner: "{{ app_user }}"
+            group: "{{ app_user }}"
+            mode: "0644"
+
+    # ------------------------------------------------------------------
+    # Systemd service
+    # ------------------------------------------------------------------
+    - name: Configure .NET application systemd service
+      tags:
+        - service
+        - systemd
+      block:
+        - name: Deploy systemd service unit for .NET application
+          ansible.builtin.template:
+            src: dotnet_app.service.j2
+            dest: "/etc/systemd/system/{{ app_name }}.service"
+            owner: root
+            group: root
+            mode: "0644"
+          notify:
+            - "reload systemd"
+            - "restart app"
+
+        - name: Enable and start .NET application service
+          ansible.builtin.systemd:
+            name: "{{ app_name }}"
+            enabled: true
+            state: started
+            daemon_reload: true
+
+    # ------------------------------------------------------------------
+    # Nginx reverse proxy
+    # ------------------------------------------------------------------
+    - name: Configure Nginx reverse proxy
+      tags:
+        - nginx
+        - proxy
+      block:
+        - name: Remove default nginx site
+          ansible.builtin.file:
+            path: /etc/nginx/sites-enabled/default
+            state: absent
+          notify: "reload nginx"
+
+        - name: Deploy Nginx reverse proxy configuration
+          ansible.builtin.template:
+            src: dotnet_nginx.conf.j2
+            dest: "/etc/nginx/sites-available/{{ app_name }}.conf"
+            owner: root
+            group: root
+            mode: "0644"
+          notify: "reload nginx"
+
+        - name: Enable Nginx site configuration
+          ansible.builtin.file:
+            src: "/etc/nginx/sites-available/{{ app_name }}.conf"
+            dest: "/etc/nginx/sites-enabled/{{ app_name }}.conf"
+            state: link
+          notify: "reload nginx"
+
+        - name: Validate Nginx configuration
+          ansible.builtin.command:
+            cmd: nginx -t
+          changed_when: false
+
+        - name: Ensure Nginx is enabled and running
+          ansible.builtin.systemd:
+            name: nginx
+            enabled: true
+            state: started
+
+    # ------------------------------------------------------------------
+    # Verification
+    # ------------------------------------------------------------------
+    - name: Verify .NET application deployment
+      tags:
+        - verify
+      block:
+        - name: Wait for application to become available
+          ansible.builtin.uri:
+            url: "http://localhost:{{ app_port }}/"
+            method: GET
+            status_code:
+              - 200
+              - 301
+              - 302
+          register: health_check
+          retries: 15
+          delay: 3
+          until: health_check is not failed
+
+        - name: Display deployment result
+          ansible.builtin.debug:
+            msg: "{{ app_name }} (.NET {{ dotnet_version }}) deployed successfully on port {{ app_port }}"

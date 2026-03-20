@@ -1,0 +1,140 @@
+---
+# Playbook: Provision AWS EC2 Instances
+# Description: Creates EC2 instances in AWS using the amazon.aws collection.
+#              Uses the current amazon.aws.ec2_instance module (NOT the deprecated ec2 module).
+# Requirements:
+#   - ansible-galaxy collection install amazon.aws
+#   - AWS credentials configured (env vars, ~/.aws/credentials, or IAM role)
+# Usage:
+#   ansible-playbook ec2_provisioning.yml -e "ami_id=ami-0abcdef1234567890 key_name=my-key"
+#   ansible-playbook ec2_provisioning.yml --tags provision
+#   ansible-playbook ec2_provisioning.yml --tags verify
+
+- name: Provision AWS EC2 Instances
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    aws_region: "us-east-2"
+    instance_type: "t3.medium"
+    ami_id: "ami-0ea3c35c5c3284d82"  # Ubuntu 22.04 LTS us-east-2 (update as needed)
+    key_name: "ansible-deploy-key"
+    vpc_subnet_id: ""
+    security_group: "default"
+    instance_count: 1
+    instance_tags:
+      Name: "ansible-managed-instance"
+      Environment: "development"
+      ManagedBy: "ansible"
+      Project: "infrastructure"
+    wait_for_running: true
+    wait_timeout: 600
+
+  tasks:
+    - name: Validate required variables
+      ansible.builtin.assert:
+        that:
+          - ami_id | length > 0
+          - key_name | length > 0
+          - vpc_subnet_id | length > 0
+        fail_msg: >-
+          Required variables missing. Provide ami_id, key_name, and vpc_subnet_id.
+          Example: -e "ami_id=ami-xxx key_name=my-key vpc_subnet_id=subnet-xxx"
+        success_msg: "All required variables are set."
+      tags:
+        - provision
+        - validate
+
+    - name: Provision EC2 instances
+      amazon.aws.ec2_instance:
+        region: "{{ aws_region }}"
+        instance_type: "{{ instance_type }}"
+        image_id: "{{ ami_id }}"
+        key_name: "{{ key_name }}"
+        vpc_subnet_id: "{{ vpc_subnet_id }}"
+        security_group: "{{ security_group }}"
+        count: "{{ instance_count }}"
+        wait: "{{ wait_for_running }}"
+        wait_timeout: "{{ wait_timeout }}"
+        state: running
+        tags: "{{ instance_tags }}"
+        network:
+          assign_public_ip: true
+        volumes:
+          - device_name: /dev/sda1
+            ebs:
+              volume_size: 20
+              volume_type: gp3
+              delete_on_termination: true
+              encrypted: true
+      register: ec2_result
+      tags:
+        - provision
+
+    - name: Display provisioned instance IDs
+      ansible.builtin.debug:
+        msg: >-
+          Instance IDs: {{ ec2_result.instances | map(attribute='instance_id') | list }}
+      when: ec2_result.instances is defined
+      tags:
+        - provision
+        - verify
+
+    - name: Display provisioned instance public IPs
+      ansible.builtin.debug:
+        msg: >-
+          Public IPs: {{ ec2_result.instances
+            | selectattr('public_ip_address', 'defined')
+            | map(attribute='public_ip_address')
+            | list }}
+      when: ec2_result.instances is defined
+      tags:
+        - provision
+        - verify
+
+    - name: Display provisioned instance private IPs
+      ansible.builtin.debug:
+        msg: >-
+          Private IPs: {{ ec2_result.instances
+            | map(attribute='private_ip_address')
+            | list }}
+      when: ec2_result.instances is defined
+      tags:
+        - provision
+        - verify
+
+    - name: Display full instance details
+      ansible.builtin.debug:
+        msg:
+          - "Instance ID: {{ item.instance_id }}"
+          - "State: {{ item.state.name }}"
+          - "Type: {{ item.instance_type }}"
+          - "Public IP: {{ item.public_ip_address | default('N/A') }}"
+          - "Private IP: {{ item.private_ip_address }}"
+          - "Subnet: {{ item.subnet_id }}"
+          - "AZ: {{ item.placement.availability_zone }}"
+      loop: "{{ ec2_result.instances }}"
+      loop_control:
+        label: "{{ item.instance_id }}"
+      when: ec2_result.instances is defined
+      tags:
+        - provision
+        - verify
+
+    - name: Wait for SSH to become available
+      ansible.builtin.wait_for:
+        host: "{{ item.public_ip_address }}"
+        port: 22
+        delay: 10
+        timeout: 300
+        state: started
+      loop: "{{ ec2_result.instances }}"
+      loop_control:
+        label: "{{ item.instance_id }}"
+      when:
+        - ec2_result.instances is defined
+        - item.public_ip_address is defined
+      tags:
+        - provision
+        - wait

@@ -1,0 +1,103 @@
+# Ansible managed - Systemd service unit for Spring Boot application
+# Template: springboot.service.j2
+#
+# Variables:
+#   app_name                - Application name (default: springboot-app)
+#   app_dir                 - Directory containing the JAR file (default: /opt/{{ app_name }})
+#   app_user                - User to run the service (default: springboot)
+#   app_group               - Group to run the service (default: springboot)
+#   java_bin                - Path to java binary (default: /usr/bin/java)
+#   java_opts               - JVM options (default: -Xms256m -Xmx512m)
+#   spring_profiles_active  - Active Spring profiles (default: production)
+#   server_port             - Server port (default: 8080)
+#   spring_extra_env        - Dict of additional environment variables (optional)
+
+[Unit]
+Description={{ app_name | default('springboot-app') }} Spring Boot Application
+Documentation=https://spring.io/projects/spring-boot
+After=network.target
+{% if requires_redis | default(false) %}
+After=redis.service
+{% endif %}
+{% if requires_postgresql | default(false) %}
+After=postgresql.service
+{% endif %}
+{% if requires_mysql | default(false) %}
+After=mysql.service
+{% endif %}
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# User and group
+User={{ app_user | default('springboot') }}
+Group={{ app_group | default('springboot') }}
+
+# Working directory
+WorkingDirectory={{ app_dir | default('/opt/' + app_name) }}
+
+# Environment variables
+Environment=SPRING_PROFILES_ACTIVE={{ spring_profiles_active | default('production') }}
+Environment=SERVER_PORT={{ server_port | default(8080) }}
+{% if spring_datasource_url is defined %}
+Environment=SPRING_DATASOURCE_URL={{ spring_datasource_url }}
+{% endif %}
+{% if spring_datasource_username is defined %}
+Environment=SPRING_DATASOURCE_USERNAME={{ spring_datasource_username }}
+{% endif %}
+{% if spring_datasource_password is defined %}
+Environment=SPRING_DATASOURCE_PASSWORD={{ spring_datasource_password }}
+{% endif %}
+{% if spring_extra_env is defined %}
+{% for key, value in spring_extra_env.items() %}
+Environment={{ key }}={{ value }}
+{% endfor %}
+{% endif %}
+
+# Spring Boot JAR execution
+# java_opts: JVM memory and GC tuning options
+# The JAR is an executable fat JAR with embedded Tomcat/Jetty
+ExecStart={{ java_bin | default('/usr/bin/java') }} \
+    {{ java_opts | default('-Xms256m -Xmx512m') }} \
+{% if java_gc_opts is defined %}
+    {{ java_gc_opts }} \
+{% endif %}
+{% if enable_jmx | default(false) %}
+    -Dcom.sun.management.jmxremote \
+    -Dcom.sun.management.jmxremote.port={{ jmx_port | default(9090) }} \
+    -Dcom.sun.management.jmxremote.authenticate=false \
+    -Dcom.sun.management.jmxremote.ssl=false \
+{% endif %}
+    -jar {{ app_dir | default('/opt/' + app_name) }}/{{ app_jar | default(app_name + '.jar') }}
+
+# Spring Boot uses exit code 143 for graceful shutdown (SIGTERM)
+SuccessExitStatus=143
+
+# Restart policy
+Restart=always
+RestartSec=10
+
+# Graceful shutdown - Spring Boot needs time to complete in-flight requests
+TimeoutStopSec={{ shutdown_timeout | default(30) }}
+KillSignal=SIGTERM
+
+# Standard output and error
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier={{ app_name | default('springboot-app') }}
+
+# File descriptor limit
+LimitNOFILE={{ nofile_limit | default(65536) }}
+
+# Core dump limit (0 = disabled)
+LimitCORE=0
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

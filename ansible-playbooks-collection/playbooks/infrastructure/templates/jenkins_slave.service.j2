@@ -1,0 +1,54 @@
+# {{ ansible_managed }}
+# Jenkins Agent systemd service unit
+# Agent: {{ agent_name }}
+# Master: {{ jenkins_master_url }}
+
+[Unit]
+Description=Jenkins Agent - {{ agent_name }}
+Documentation=https://www.jenkins.io/doc/book/using/using-agents/
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User={{ jenkins_user }}
+Group={{ jenkins_group }}
+WorkingDirectory={{ jenkins_workspace }}
+
+ExecStart=/usr/bin/java \
+  -Xmx512m \
+  -Xms256m \
+  -jar {{ jenkins_home }}/agent.jar \
+  -url {{ jenkins_master_url }} \
+  -name {{ agent_name }} \
+  -secret {{ agent_secret }} \
+  -workDir {{ jenkins_workspace }}
+
+Restart=on-failure
+RestartSec=10
+
+# Security hardening
+NoNewPrivileges=false
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths={{ jenkins_home }} {{ jenkins_workspace }}
+
+# Environment
+Environment="JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64"
+Environment="MAVEN_HOME={{ maven_install_dir | default('/opt/maven') }}/apache-maven-{{ maven_version | default('3.9.9') }}"
+Environment="GRADLE_HOME={{ gradle_install_dir | default('/opt/gradle') }}/gradle-{{ gradle_version | default('8.12') }}"
+Environment="PATH=/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=jenkins-agent
+
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=4096
+
+[Install]
+WantedBy=multi-user.target

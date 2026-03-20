@@ -1,0 +1,253 @@
+---
+# Ansible Playbook: SSL/TLS Certificate Setup with Let's Encrypt
+# Obtains and configures SSL certificates using Certbot.
+# Usage: ansible-playbook ssl_certificate.yml --limit webservers -e domain_name=example.com
+
+- name: Set up SSL/TLS certificates with Let's Encrypt
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    domain_name: "example.com"
+    domain_names:
+      - "{{ domain_name }}"
+      - "www.{{ domain_name }}"
+    certbot_email: "admin@{{ domain_name }}"
+    certbot_plugin: "nginx"  # Options: nginx, standalone, webroot
+    webroot_path: "/var/www/html"
+    certbot_agree_tos: true
+    certbot_staging: false  # Set to true for testing with staging server
+    certbot_force_renewal: false
+    certbot_auto_renew: true
+    certbot_renew_timer_calendar: "*-*-* 03:00:00"
+    certbot_pre_hook: ""
+    certbot_post_hook: "systemctl reload nginx"
+    certbot_deploy_hook: ""
+    ssl_dhparam_size: 2048
+    ssl_generate_dhparam: true
+
+  handlers:
+    - name: Reload nginx
+      ansible.builtin.systemd:
+        name: nginx
+        state: reloaded
+      failed_when: false
+
+    - name: Restart nginx
+      ansible.builtin.systemd:
+        name: nginx
+        state: restarted
+      failed_when: false
+
+  tasks:
+    - name: Install Certbot and dependencies
+      tags: [install]
+      block:
+        - name: Update apt cache
+          ansible.builtin.apt:
+            update_cache: true
+            cache_valid_time: 3600
+
+        - name: Install Certbot packages
+          ansible.builtin.apt:
+            name:
+              - certbot
+              - "{{ 'python3-certbot-nginx' if certbot_plugin == 'nginx' else 'python3-certbot-apache' if certbot_plugin == 'apache' else 'certbot' }}"
+            state: present
+
+    - name: Prepare for certificate request
+      tags: [configure]
+      block:
+        - name: Create webroot directory for standalone/webroot validation
+          ansible.builtin.file:
+            path: "{{ webroot_path }}/.well-known/acme-challenge"
+            state: directory
+            owner: www-data
+            group: www-data
+            mode: "0755"
+          when: certbot_plugin in ['webroot', 'standalone']
+
+    - name: Run dry-run verification first
+      tags: [verify, certificate]
+      block:
+        - name: Build certbot domain arguments
+          ansible.builtin.set_fact:
+            certbot_domain_args: "{{ domain_names | map('regex_replace', '^(.*)$', '-d \\1') | join(' ') }}"
+
+        - name: Execute Certbot dry-run
+          ansible.builtin.command:
+            cmd: >-
+              certbot certonly
+              --dry-run
+              --{{ certbot_plugin }}
+              {{ certbot_domain_args }}
+              --email {{ certbot_email }}
+              --agree-tos
+              --non-interactive
+              {% if certbot_plugin == 'webroot' %}--webroot-path {{ webroot_path }}{% endif %}
+              {% if certbot_staging %}--staging{% endif %}
+          changed_when: false
+          register: certbot_dryrun
+          failed_when: false
+
+        - name: Display dry-run result
+          ansible.builtin.debug:
+            msg: "{{ certbot_dryrun.stdout_lines | default([]) }}"
+
+        - name: Warn if dry-run failed
+          ansible.builtin.debug:
+            msg: >-
+              WARNING: Certbot dry-run failed. This may indicate DNS or
+              connectivity issues. The actual certificate request may also fail.
+              Error: {{ certbot_dryrun.stderr | default('Unknown error') }}
+          when: certbot_dryrun.rc != 0
+
+    - name: Obtain SSL certificate
+      tags: [certificate]
+      block:
+        - name: Request SSL certificate from Let's Encrypt
+          ansible.builtin.command:
+            cmd: >-
+              certbot certonly
+              --{{ certbot_plugin }}
+              {{ certbot_domain_args }}
+              --email {{ certbot_email }}
+              {% if certbot_agree_tos %}--agree-tos{% endif %}
+              --non-interactive
+              {% if certbot_plugin == 'webroot' %}--webroot-path {{ webroot_path }}{% endif %}
+              {% if certbot_staging %}--staging{% endif %}
+              {% if certbot_force_renewal %}--force-renewal{% endif %}
+              --keep-until-expiring
+            creates: "/etc/letsencrypt/live/{{ domain_name }}/fullchain.pem"
+          register: certbot_result
+          notify: Reload nginx
+
+        - name: Display certificate request result
+          ansible.builtin.debug:
+            msg: "{{ certbot_result.stdout_lines | default(['Certificate already exists']) }}"
+
+    - name: Generate strong DH parameters
+      tags: [configure, security]
+      block:
+        - name: Generate Diffie-Hellman parameters
+          ansible.builtin.command:
+            cmd: "openssl dhparam -out /etc/ssl/certs/dhparam.pem {{ ssl_dhparam_size }}"
+            creates: /etc/ssl/certs/dhparam.pem
+          when: ssl_generate_dhparam | bool
+          async: 600
+          poll: 15
+
+    - name: Configure auto-renewal
+      tags: [configure, renewal]
+      block:
+        - name: Deploy Certbot renewal configuration
+          ansible.builtin.copy:
+            content: |
+              # Certbot Renewal Configuration
+              # Managed by Ansible - do not edit manually
+              [renewalparams]
+              account = {{ certbot_result.stdout | default('') | regex_search('Account registered', 'found') | default('existing', true) }}
+              authenticator = {{ certbot_plugin }}
+              {% if certbot_plugin == 'webroot' %}
+              webroot_path = {{ webroot_path }}
+              {% endif %}
+              server = {{ 'https://acme-staging-v02.api.letsencrypt.org/directory' if certbot_staging else 'https://acme-v02.api.letsencrypt.org/directory' }}
+            dest: "/etc/letsencrypt/renewal/{{ domain_name }}.conf"
+            mode: "0644"
+          when: certbot_result is changed
+          failed_when: false
+
+        - name: Create systemd timer for certificate renewal
+          ansible.builtin.copy:
+            content: |
+              # Certbot Renewal Timer
+              # Managed by Ansible - do not edit manually
+              [Unit]
+              Description=Certbot renewal timer
+
+              [Timer]
+              OnCalendar={{ certbot_renew_timer_calendar }}
+              RandomizedDelaySec=3600
+              Persistent=true
+
+              [Install]
+              WantedBy=timers.target
+            dest: /etc/systemd/system/certbot-renewal.timer
+            mode: "0644"
+          when: certbot_auto_renew | bool
+
+        - name: Create systemd service for certificate renewal
+          ansible.builtin.copy:
+            content: |
+              # Certbot Renewal Service
+              # Managed by Ansible - do not edit manually
+              [Unit]
+              Description=Certbot renewal service
+              After=network-online.target
+              Wants=network-online.target
+
+              [Service]
+              Type=oneshot
+              ExecStart=/usr/bin/certbot renew --quiet --deploy-hook "{{ certbot_post_hook }}"
+              {% if certbot_pre_hook | length > 0 %}
+              ExecStartPre={{ certbot_pre_hook }}
+              {% endif %}
+              PrivateTmp=true
+            dest: /etc/systemd/system/certbot-renewal.service
+            mode: "0644"
+          when: certbot_auto_renew | bool
+
+        - name: Enable and start certbot renewal timer
+          ansible.builtin.systemd:
+            name: certbot-renewal.timer
+            state: started
+            enabled: true
+            daemon_reload: true
+          when: certbot_auto_renew | bool
+
+    - name: Verify SSL certificate
+      tags: [verify]
+      block:
+        - name: Check if certificate files exist
+          ansible.builtin.stat:
+            path: "/etc/letsencrypt/live/{{ domain_name }}/{{ item }}"
+          loop:
+            - fullchain.pem
+            - privkey.pem
+            - chain.pem
+            - cert.pem
+          register: cert_files
+
+        - name: Display certificate file status
+          ansible.builtin.debug:
+            msg: "{{ item.item }}: {{ 'EXISTS' if item.stat.exists else 'MISSING' }}"
+          loop: "{{ cert_files.results }}"
+          loop_control:
+            label: "{{ item.item }}"
+
+        - name: Get certificate details
+          ansible.builtin.command:
+            cmd: >-
+              openssl x509 -in /etc/letsencrypt/live/{{ domain_name }}/fullchain.pem
+              -noout -subject -issuer -dates
+          changed_when: false
+          register: cert_details
+          when: cert_files.results[0].stat.exists | default(false)
+
+        - name: Display certificate details
+          ansible.builtin.debug:
+            msg: "{{ cert_details.stdout_lines }}"
+          when: cert_details is not skipped
+
+        - name: Check renewal timer status
+          ansible.builtin.command:
+            cmd: systemctl list-timers certbot-renewal.timer
+          changed_when: false
+          register: timer_status
+          when: certbot_auto_renew | bool
+
+        - name: Display renewal timer status
+          ansible.builtin.debug:
+            msg: "{{ timer_status.stdout_lines }}"
+          when: certbot_auto_renew | bool and timer_status is not skipped

@@ -1,0 +1,379 @@
+---
+# Playbook: Deploy Scala Play Framework Application
+# Target OS: Ubuntu 22.04
+# Requires: Pre-built distribution archive (sbt dist), Java 17 runtime
+# Usage: ansible-playbook scala_play_deployment.yml -e "dist_source=/path/to/app.zip play_secret=changeme"
+
+- name: Deploy Scala Play Framework Application
+  hosts: all
+  become: true
+
+  vars:
+    app_name: "play-app"
+    app_dir: "/opt/{{ app_name }}"
+    app_port: 9000
+    app_user: "playapp"
+    app_group: "playapp"
+    dist_source: "files/{{ app_name }}.zip"
+    dist_format: "zip"
+    play_secret: "CHANGE_ME_generate_a_real_secret"
+    java_opts: "-Xms256m -Xmx512m -XX:+UseG1GC -XX:+UseStringDeduplication"
+    server_name: "app.example.com"
+    log_dir: "/var/log/{{ app_name }}"
+    pid_dir: "/run/{{ app_name }}"
+    config_dir: "/etc/{{ app_name }}"
+    java_version: "17"
+    play_http_address: "127.0.0.1"
+    play_http_port: "{{ app_port }}"
+    db_url: ""
+    db_user: ""
+    db_password: ""
+    extra_java_opts: ""
+    allowed_hosts:
+      - "{{ server_name }}"
+      - "localhost"
+    extra_config: ""
+
+  handlers:
+    - name: Restart play
+      ansible.builtin.systemd:
+        name: "{{ app_name }}"
+        state: restarted
+        daemon_reload: true
+      tags:
+        - play
+
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+      tags:
+        - play
+
+    - name: Reload nginx
+      ansible.builtin.systemd:
+        name: nginx
+        state: reloaded
+      tags:
+        - nginx
+
+    - name: Restart nginx
+      ansible.builtin.systemd:
+        name: nginx
+        state: restarted
+      tags:
+        - nginx
+
+  tasks:
+    # ------------------------------------------------------------------
+    # Java Installation
+    # ------------------------------------------------------------------
+    - name: Install Java {{ java_version }} runtime
+      tags:
+        - install
+        - java
+      block:
+        - name: Install prerequisite packages
+          ansible.builtin.apt:
+            name:
+              - software-properties-common
+              - apt-transport-https
+              - ca-certificates
+              - curl
+              - unzip
+            state: present
+            update_cache: true
+
+        - name: Install OpenJDK {{ java_version }} headless runtime
+          ansible.builtin.apt:
+            name: "openjdk-{{ java_version }}-jre-headless"
+            state: present
+            update_cache: true
+
+        - name: Verify Java installation
+          ansible.builtin.command:
+            cmd: "java -version"
+          changed_when: false
+          register: java_check
+
+        - name: Display Java version
+          ansible.builtin.debug:
+            msg: "{{ java_check.stderr_lines }}"
+
+    # ------------------------------------------------------------------
+    # Application User and Directories
+    # ------------------------------------------------------------------
+    - name: Create application user and directories
+      tags:
+        - setup
+      block:
+        - name: Create application group
+          ansible.builtin.group:
+            name: "{{ app_group }}"
+            system: true
+
+        - name: Create application user
+          ansible.builtin.user:
+            name: "{{ app_user }}"
+            group: "{{ app_group }}"
+            home: "/home/{{ app_user }}"
+            shell: "/usr/sbin/nologin"
+            system: true
+            create_home: true
+
+        - name: Create application directory
+          ansible.builtin.file:
+            path: "{{ app_dir }}"
+            state: directory
+            owner: "{{ app_user }}"
+            group: "{{ app_group }}"
+            mode: "0755"
+
+        - name: Create log directory
+          ansible.builtin.file:
+            path: "{{ log_dir }}"
+            state: directory
+            owner: "{{ app_user }}"
+            group: "{{ app_group }}"
+            mode: "0755"
+
+        - name: Create PID directory
+          ansible.builtin.file:
+            path: "{{ pid_dir }}"
+            state: directory
+            owner: "{{ app_user }}"
+            group: "{{ app_group }}"
+            mode: "0755"
+
+        - name: Create configuration directory
+          ansible.builtin.file:
+            path: "{{ config_dir }}"
+            state: directory
+            owner: root
+            group: "{{ app_group }}"
+            mode: "0750"
+
+    # ------------------------------------------------------------------
+    # Application Deployment
+    # ------------------------------------------------------------------
+    - name: Deploy Scala Play application
+      tags:
+        - deploy
+        - play
+      block:
+        - name: Stop application before deployment
+          ansible.builtin.systemd:
+            name: "{{ app_name }}"
+            state: stopped
+          failed_when: false
+
+        - name: Create release directory for current deployment
+          ansible.builtin.file:
+            path: "{{ app_dir }}/current"
+            state: directory
+            owner: "{{ app_user }}"
+            group: "{{ app_group }}"
+            mode: "0755"
+
+        - name: Copy distribution archive
+          ansible.builtin.copy:
+            src: "{{ dist_source }}"
+            dest: "/tmp/{{ app_name }}-dist.{{ dist_format }}"
+            owner: "{{ app_user }}"
+            group: "{{ app_group }}"
+            mode: "0644"
+
+        - name: Remove previous deployment
+          ansible.builtin.file:
+            path: "{{ app_dir }}/current"
+            state: absent
+
+        - name: Create fresh release directory
+          ansible.builtin.file:
+            path: "{{ app_dir }}/current"
+            state: directory
+            owner: "{{ app_user }}"
+            group: "{{ app_group }}"
+            mode: "0755"
+
+        - name: Unarchive distribution (ZIP format)
+          ansible.builtin.unarchive:
+            src: "/tmp/{{ app_name }}-dist.{{ dist_format }}"
+            dest: "{{ app_dir }}/current"
+            remote_src: true
+            owner: "{{ app_user }}"
+            group: "{{ app_group }}"
+            extra_opts:
+              - "-o"
+          when: dist_format == "zip"
+
+        - name: Unarchive distribution (TGZ format)
+          ansible.builtin.unarchive:
+            src: "/tmp/{{ app_name }}-dist.{{ dist_format }}"
+            dest: "{{ app_dir }}/current"
+            remote_src: true
+            owner: "{{ app_user }}"
+            group: "{{ app_group }}"
+          when: dist_format in ["tgz", "tar.gz"]
+
+        - name: Find extracted directory name
+          ansible.builtin.command:
+            cmd: "ls -1 {{ app_dir }}/current/"
+          register: extracted_dirs
+          changed_when: false
+
+        - name: Set extracted directory path
+          ansible.builtin.set_fact:
+            play_home: "{{ app_dir }}/current/{{ extracted_dirs.stdout_lines[0] }}"
+          when: extracted_dirs.stdout_lines | length > 0
+
+        - name: Make bin scripts executable
+          ansible.builtin.command:
+            cmd: "chmod +x {{ play_home }}/bin/*"
+          changed_when: true
+
+        - name: Create symlink for logs directory
+          ansible.builtin.file:
+            src: "{{ log_dir }}"
+            dest: "{{ play_home }}/logs"
+            state: link
+            owner: "{{ app_user }}"
+            group: "{{ app_group }}"
+            force: true
+
+    # ------------------------------------------------------------------
+    # Application Configuration
+    # ------------------------------------------------------------------
+    - name: Deploy Play Framework configuration
+      tags:
+        - config
+        - play
+      block:
+        - name: Deploy production configuration override
+          ansible.builtin.template:
+            src: "templates/scala_play_production.conf.j2"
+            dest: "{{ config_dir }}/production.conf"
+            owner: root
+            group: "{{ app_group }}"
+            mode: "0640"
+          notify: Restart play
+
+        - name: Deploy environment file
+          ansible.builtin.template:
+            src: "templates/scala_play_env.j2"
+            dest: "/etc/default/{{ app_name }}"
+            owner: root
+            group: "{{ app_group }}"
+            mode: "0640"
+          notify: Restart play
+
+    # ------------------------------------------------------------------
+    # Systemd Service Configuration
+    # ------------------------------------------------------------------
+    - name: Configure systemd service
+      tags:
+        - service
+        - play
+      block:
+        - name: Deploy tmpfiles.d configuration for PID directory
+          ansible.builtin.copy:
+            content: "d {{ pid_dir }} 0755 {{ app_user }} {{ app_group }} -"
+            dest: "/etc/tmpfiles.d/{{ app_name }}.conf"
+            owner: root
+            group: root
+            mode: "0644"
+
+        - name: Deploy Scala Play systemd service unit
+          ansible.builtin.template:
+            src: "templates/scala_play.service.j2"
+            dest: "/etc/systemd/system/{{ app_name }}.service"
+            owner: root
+            group: root
+            mode: "0644"
+          notify:
+            - Reload systemd
+            - Restart play
+
+        - name: Ensure Play service is enabled and running
+          ansible.builtin.systemd:
+            name: "{{ app_name }}"
+            state: started
+            enabled: true
+            daemon_reload: true
+
+    # ------------------------------------------------------------------
+    # Nginx Reverse Proxy
+    # ------------------------------------------------------------------
+    - name: Configure Nginx reverse proxy
+      tags:
+        - nginx
+        - config
+      block:
+        - name: Install Nginx
+          ansible.builtin.apt:
+            name: nginx
+            state: present
+
+        - name: Remove default Nginx site
+          ansible.builtin.file:
+            path: "/etc/nginx/sites-enabled/default"
+            state: absent
+          notify: Reload nginx
+
+        - name: Deploy Play Nginx configuration
+          ansible.builtin.template:
+            src: "templates/scala_play_nginx.conf.j2"
+            dest: "/etc/nginx/sites-available/{{ app_name }}.conf"
+            owner: root
+            group: root
+            mode: "0644"
+          notify: Reload nginx
+
+        - name: Enable Play Nginx virtual host
+          ansible.builtin.file:
+            src: "/etc/nginx/sites-available/{{ app_name }}.conf"
+            dest: "/etc/nginx/sites-enabled/{{ app_name }}.conf"
+            state: link
+          notify: Reload nginx
+
+        - name: Validate Nginx configuration
+          ansible.builtin.command:
+            cmd: "nginx -t"
+          changed_when: false
+
+        - name: Ensure Nginx is enabled and running
+          ansible.builtin.systemd:
+            name: nginx
+            state: started
+            enabled: true
+
+    # ------------------------------------------------------------------
+    # Health Check
+    # ------------------------------------------------------------------
+    - name: Verify Scala Play application health
+      tags:
+        - verify
+      block:
+        - name: Wait for Play to start listening
+          ansible.builtin.wait_for:
+            port: "{{ app_port }}"
+            host: "{{ play_http_address }}"
+            delay: 10
+            timeout: 90
+
+        - name: Check application health endpoint
+          ansible.builtin.uri:
+            url: "http://{{ play_http_address }}:{{ app_port }}"
+            status_code:
+              - 200
+              - 301
+              - 302
+              - 303
+            timeout: 15
+          register: health_check
+          retries: 5
+          delay: 5
+          until: health_check is succeeded
+
+        - name: Display deployment success
+          ansible.builtin.debug:
+            msg: "Scala Play application '{{ app_name }}' deployed successfully on {{ play_http_address }}:{{ app_port }}"

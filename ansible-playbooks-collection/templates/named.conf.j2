@@ -1,0 +1,157 @@
+// Ansible managed - BIND9 DNS server configuration
+// Template: named.conf.j2
+//
+// Variables:
+//   dns_listen_address    - Address to listen on (default: any)
+//   dns_listen_port       - Port to listen on (default: 53)
+//   dns_forwarders        - List of upstream DNS forwarders (default: ['8.8.8.8', '8.8.4.4'])
+//   dns_allow_query       - Networks allowed to query (default: ['localhost', 'localnets'])
+//   dns_allow_recursion   - Networks allowed recursive queries (default: ['localhost', 'localnets'])
+//   dns_allow_transfer    - Networks allowed zone transfers (default: ['none'])
+//   dns_zones             - List of zone definitions (see below for structure)
+//   dns_dnssec_validation - Enable DNSSEC validation (default: auto)
+
+// ACL for trusted networks
+acl "trusted" {
+{% for network in dns_trusted_networks | default(['10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16']) %}
+    {{ network }};
+{% endfor %}
+    localhost;
+    localnets;
+};
+
+options {
+    // Listen address and port
+    listen-on port {{ dns_listen_port | default(53) }} {
+{% for addr in dns_listen_address | default(['any']) %}
+        {{ addr }};
+{% endfor %}
+    };
+
+{% if dns_listen_ipv6 | default(true) %}
+    listen-on-v6 port {{ dns_listen_port | default(53) }} { any; };
+{% else %}
+    listen-on-v6 { none; };
+{% endif %}
+
+    // Working directory and cache
+    directory "/var/named";
+    dump-file "/var/named/data/cache_dump.db";
+    statistics-file "/var/named/data/named_stats.txt";
+    memstatistics-file "/var/named/data/named_mem_stats.txt";
+
+    // Forwarders - upstream DNS servers for queries we cannot resolve locally
+    forwarders {
+{% for forwarder in dns_forwarders | default(['8.8.8.8', '8.8.4.4']) %}
+        {{ forwarder }};
+{% endfor %}
+    };
+
+    // Forward policy: 'first' tries forwarders then resolves locally, 'only' uses forwarders exclusively
+    forward {{ dns_forward_policy | default('first') }};
+
+    // Access control
+    allow-query {
+{% for acl in dns_allow_query | default(['trusted']) %}
+        {{ acl }};
+{% endfor %}
+    };
+
+    allow-recursion {
+{% for acl in dns_allow_recursion | default(['trusted']) %}
+        {{ acl }};
+{% endfor %}
+    };
+
+    allow-transfer {
+{% for acl in dns_allow_transfer | default(['none']) %}
+        {{ acl }};
+{% endfor %}
+    };
+
+    // DNSSEC validation
+    dnssec-validation {{ dns_dnssec_validation | default('auto') }};
+
+    // Security settings - hide BIND version
+    version "not disclosed";
+
+    // Recursion - enable for internal DNS server
+    recursion {{ dns_recursion | default('yes') }};
+
+    // Maximum cache size (in bytes, 0 = unlimited)
+    max-cache-size {{ dns_max_cache_size | default('256m') }};
+};
+
+// Logging configuration
+logging {
+    channel default_log {
+        file "/var/log/named/named.log" versions 3 size 5m;
+        severity {{ dns_log_severity | default('info') }};
+        print-time yes;
+        print-severity yes;
+        print-category yes;
+    };
+
+    channel query_log {
+        file "/var/log/named/query.log" versions 3 size 10m;
+        severity info;
+        print-time yes;
+    };
+
+    category default { default_log; };
+{% if dns_log_queries | default(false) %}
+    category queries { query_log; };
+{% endif %}
+};
+
+// Root hints and localhost zones
+zone "." IN {
+    type hint;
+    file "named.ca";
+};
+
+zone "localhost" IN {
+    type master;
+    file "named.localhost";
+    allow-update { none; };
+};
+
+zone "0.0.127.in-addr.arpa" IN {
+    type master;
+    file "named.loopback";
+    allow-update { none; };
+};
+
+// Custom zone definitions
+{% for zone in dns_zones | default([]) %}
+// Zone: {{ zone.name }}
+zone "{{ zone.name }}" IN {
+    type {{ zone.type | default('master') }};
+{% if zone.type | default('master') == 'master' %}
+    file "{{ zone.file | default('/var/named/db.' + zone.name) }}";
+    allow-update { {{ zone.allow_update | default('none') }}; };
+{% if zone.also_notify is defined %}
+    also-notify {
+{% for notify_server in zone.also_notify %}
+        {{ notify_server }};
+{% endfor %}
+    };
+{% endif %}
+{% elif zone.type == 'slave' %}
+    file "{{ zone.file | default('/var/named/slaves/db.' + zone.name) }}";
+    masters {
+{% for master in zone.masters %}
+        {{ master }};
+{% endfor %}
+    };
+{% elif zone.type == 'forward' %}
+    forward only;
+    forwarders {
+{% for fwd in zone.forwarders %}
+        {{ fwd }};
+{% endfor %}
+    };
+{% endif %}
+};
+
+{% endfor %}

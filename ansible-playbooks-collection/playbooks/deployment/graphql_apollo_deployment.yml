@@ -1,0 +1,191 @@
+---
+- name: Deploy GraphQL Apollo Server
+  hosts: all
+  become: true
+
+  vars:
+    app_name: apollo-graphql
+    app_dir: /opt/{{ app_name }}
+    app_port: 4000
+    app_user: "{{ app_name }}"
+    git_repo: ""
+    node_env: production
+    cors_origin: "*"
+    node_version: "20"
+
+  handlers:
+    - name: Restart app
+      ansible.builtin.systemd:
+        name: "{{ app_name }}"
+        state: restarted
+
+    - name: Reload nginx
+      ansible.builtin.systemd:
+        name: nginx
+        state: reloaded
+
+  tasks:
+    # ========================================================================
+    # NODE.JS
+    # ========================================================================
+    - name: Add NodeSource GPG key
+      ansible.builtin.apt_key:
+        url: "https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key"
+        state: present
+      tags: [nodejs]
+
+    - name: Add NodeSource repository
+      ansible.builtin.apt_repository:
+        repo: "deb https://deb.nodesource.com/node_{{ node_version }}.x nodistro main"
+        state: present
+        filename: nodesource
+        update_cache: true
+      tags: [nodejs]
+
+    - name: Install Node.js
+      ansible.builtin.apt:
+        name: nodejs
+        state: present
+      tags: [nodejs]
+
+    # ========================================================================
+    # APP USER & DIRECTORY
+    # ========================================================================
+    - name: Create application user
+      ansible.builtin.user:
+        name: "{{ app_user }}"
+        system: true
+        shell: /usr/sbin/nologin
+        home: "{{ app_dir }}"
+        create_home: false
+      tags: [setup]
+
+    - name: Create application directory
+      ansible.builtin.file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: "0755"
+      tags: [setup]
+
+    # ========================================================================
+    # DEPLOY APPLICATION
+    # ========================================================================
+    - name: Clone application repository
+      when: git_repo | length > 0
+      ansible.builtin.git:
+        repo: "{{ git_repo }}"
+        dest: "{{ app_dir }}"
+        version: main
+        force: true
+      become_user: "{{ app_user }}"
+      notify: Restart app
+      tags: [deploy]
+
+    - name: Install npm dependencies
+      ansible.builtin.command:
+        cmd: npm ci --production
+        chdir: "{{ app_dir }}"
+      become_user: "{{ app_user }}"
+      register: npm_install
+      changed_when: "'added' in npm_install.stdout"
+      tags: [deploy]
+
+    # ========================================================================
+    # SYSTEMD SERVICE
+    # ========================================================================
+    - name: Deploy Apollo Server systemd service
+      ansible.builtin.template:
+        src: ../../templates/apollo.service.j2
+        dest: /etc/systemd/system/{{ app_name }}.service
+        mode: "0644"
+      notify: Restart app
+      tags: [service]
+
+    - name: Start and enable Apollo Server
+      ansible.builtin.systemd:
+        name: "{{ app_name }}"
+        state: started
+        enabled: true
+        daemon_reload: true
+      tags: [service]
+
+    # ========================================================================
+    # NGINX REVERSE PROXY (with WebSocket support)
+    # ========================================================================
+    - name: Install Nginx
+      ansible.builtin.apt:
+        name: nginx
+        state: present
+      tags: [nginx]
+
+    - name: Deploy Nginx reverse proxy configuration
+      ansible.builtin.copy:
+        dest: /etc/nginx/sites-available/{{ app_name }}
+        content: |
+          upstream {{ app_name }} {
+              server 127.0.0.1:{{ app_port }};
+          }
+
+          server {
+              listen 80;
+              server_name {{ server_name | default('_') }};
+
+              location / {
+                  proxy_pass http://{{ app_name }};
+                  proxy_http_version 1.1;
+                  proxy_set_header Upgrade $http_upgrade;
+                  proxy_set_header Connection "upgrade";
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+                  proxy_read_timeout 86400;
+              }
+
+              location /graphql {
+                  proxy_pass http://{{ app_name }};
+                  proxy_http_version 1.1;
+                  proxy_set_header Upgrade $http_upgrade;
+                  proxy_set_header Connection "upgrade";
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+              }
+          }
+        mode: "0644"
+      notify: Reload nginx
+      tags: [nginx]
+
+    - name: Enable site
+      ansible.builtin.file:
+        src: /etc/nginx/sites-available/{{ app_name }}
+        dest: /etc/nginx/sites-enabled/{{ app_name }}
+        state: link
+      notify: Reload nginx
+      tags: [nginx]
+
+    - name: Test Nginx configuration
+      ansible.builtin.command: nginx -t
+      changed_when: false
+      tags: [nginx]
+
+    # ========================================================================
+    # VERIFICATION
+    # ========================================================================
+    - name: Wait for Apollo Server to start
+      ansible.builtin.wait_for:
+        port: "{{ app_port }}"
+        delay: 5
+        timeout: 30
+      tags: [verify]
+
+    - name: Display deployment info
+      ansible.builtin.debug:
+        msg: |
+          Apollo GraphQL Server deployed on {{ inventory_hostname }}
+          GraphQL Endpoint: http://{{ ansible_host }}:{{ app_port }}/graphql
+          Apollo Studio: http://{{ ansible_host }}:{{ app_port }}
+          Environment: {{ node_env }}

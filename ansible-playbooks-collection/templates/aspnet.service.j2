@@ -1,0 +1,37 @@
+[Unit]
+Description={{ app_name }} ASP.NET Core Application
+After=network.target
+
+[Service]
+Type=notify
+User={{ app_user | default(app_name) }}
+Group={{ app_user | default(app_name) }}
+WorkingDirectory={{ app_dir }}
+ExecStart=/usr/bin/dotnet {{ app_dir }}/{{ app_dll }}
+Restart=always
+RestartSec=10
+TimeoutStopSec=30
+
+# ASP.NET Core environment
+Environment="ASPNETCORE_ENVIRONMENT={{ environment | default('Production') }}"
+Environment="ASPNETCORE_URLS=http://0.0.0.0:{{ app_port | default(5000) }}"
+Environment="DOTNET_CLI_TELEMETRY_OPTOUT=1"
+{% if connection_string is defined %}
+Environment="ConnectionStrings__DefaultConnection={{ connection_string }}"
+{% endif %}
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier={{ app_name }}
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

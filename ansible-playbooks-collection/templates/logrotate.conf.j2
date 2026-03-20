@@ -1,0 +1,85 @@
+# Ansible managed - Logrotate configuration for application logs
+# Template: logrotate.conf.j2
+#
+# Variables:
+#   logrotate_app_name   - Application name for identification
+#   logrotate_log_paths  - List of log file paths/patterns to rotate
+#   logrotate_frequency  - Rotation frequency: daily, weekly, monthly (default: daily)
+#   logrotate_rotate     - Number of rotated files to keep (default: 14)
+#   logrotate_maxsize    - Rotate if log exceeds this size (default: 100M)
+#   logrotate_compress   - Enable compression (default: true)
+#   logrotate_create_mode - File permissions for new log files (default: 0644)
+#   logrotate_create_user - Owner of new log files (default: root)
+#   logrotate_create_group - Group of new log files (default: adm)
+#   logrotate_postrotate  - Post-rotation command (optional)
+#   logrotate_prerotate   - Pre-rotation command (optional)
+
+# Logrotate config for {{ logrotate_app_name | default('application') }}
+{% for path in logrotate_log_paths | default(['/var/log/' + logrotate_app_name | default('application') + '/*.log']) %}
+{{ path }}
+{% endfor %}
+{
+    # Rotation frequency
+    {{ logrotate_frequency | default('daily') }}
+
+    # Number of old log files to keep
+    rotate {{ logrotate_rotate | default(14) }}
+
+{% if logrotate_maxsize is defined %}
+    # Rotate if file exceeds this size regardless of frequency
+    maxsize {{ logrotate_maxsize }}
+{% endif %}
+
+{% if logrotate_minsize is defined %}
+    # Only rotate if file is at least this size
+    minsize {{ logrotate_minsize }}
+{% endif %}
+
+    # Compress old log files to save disk space
+{% if logrotate_compress | default(true) %}
+    compress
+
+    # Delay compression to the next rotation cycle
+    # This allows processes that still have the old file open to finish writing
+    delaycompress
+{% else %}
+    nocompress
+{% endif %}
+
+    # Do not error if the log file is missing
+    missingok
+
+    # Do not rotate empty log files
+    notifempty
+
+    # Create new log file with specified permissions after rotation
+    create {{ logrotate_create_mode | default('0644') }} {{ logrotate_create_user | default('root') }} {{ logrotate_create_group | default('adm') }}
+
+{% if logrotate_dateext | default(true) %}
+    # Append date to rotated file names instead of numbers
+    dateext
+    dateformat -%Y%m%d
+{% endif %}
+
+{% if logrotate_sharedscripts | default(true) %}
+    # Run postrotate/prerotate scripts only once even if multiple logs match
+    sharedscripts
+{% endif %}
+
+{% if logrotate_prerotate is defined %}
+    prerotate
+        {{ logrotate_prerotate }}
+    endscript
+{% endif %}
+
+{% if logrotate_postrotate is defined %}
+    postrotate
+        {{ logrotate_postrotate }}
+    endscript
+{% elif logrotate_service_name is defined %}
+    # Signal the service to reopen its log files after rotation
+    postrotate
+        systemctl reload {{ logrotate_service_name }} > /dev/null 2>&1 || true
+    endscript
+{% endif %}
+}

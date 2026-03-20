@@ -1,0 +1,293 @@
+---
+# Playbook: Deploy Django Application
+# Description: Installs Python 3, PostgreSQL client libraries, deploys Django app
+#              with Gunicorn, runs collectstatic/migrate, and sets up Nginx.
+# Requirements: Ubuntu 22.04 target hosts, PostgreSQL database available
+# Tags: django, python, deploy, application
+
+- name: Deploy Django Application
+  hosts: all
+  become: true
+
+  vars:
+    app_name: "djangoapp"
+    app_dir: "/opt/{{ app_name }}"
+    app_port: 8000
+    app_user: "djangoapp"
+    git_repo: ""
+    git_branch: "main"
+    db_host: "localhost"
+    db_name: "{{ app_name }}"
+    db_user: "{{ app_name }}"
+    db_password: ""
+    django_settings_module: "{{ app_name }}.settings.production"
+    django_secret_key: ""
+    allowed_hosts: "*"
+    gunicorn_workers: 4
+    gunicorn_bind: "127.0.0.1:{{ app_port }}"
+    venv_dir: "{{ app_dir }}/venv"
+    static_root: "{{ app_dir }}/staticfiles"
+    media_root: "{{ app_dir }}/media"
+    server_name: "_"
+    python_version: "python3"
+
+  handlers:
+    - name: Restart {{ app_name }}
+      ansible.builtin.systemd:
+        name: "{{ app_name }}"
+        state: restarted
+        daemon_reload: true
+      listen: "restart app"
+
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+      listen: "reload systemd"
+
+    - name: Reload nginx
+      ansible.builtin.systemd:
+        name: nginx
+        state: reloaded
+      listen: "reload nginx"
+
+    - name: Restart nginx
+      ansible.builtin.systemd:
+        name: nginx
+        state: restarted
+      listen: "restart nginx"
+
+  tasks:
+    # ------------------------------------------------------------------
+    # System dependencies
+    # ------------------------------------------------------------------
+    - name: Install system packages for Django deployment
+      tags:
+        - setup
+        - packages
+      block:
+        - name: Update apt cache
+          ansible.builtin.apt:
+            update_cache: true
+            cache_valid_time: 3600
+
+        - name: Install Python, PostgreSQL dev libraries, and system dependencies
+          ansible.builtin.apt:
+            name:
+              - python3
+              - python3-pip
+              - python3-venv
+              - python3-dev
+              - build-essential
+              - libpq-dev
+              - postgresql-client
+              - git
+              - nginx
+            state: present
+
+    # ------------------------------------------------------------------
+    # Application user and directories
+    # ------------------------------------------------------------------
+    - name: Configure application user and directories
+      tags:
+        - setup
+        - user
+      block:
+        - name: Create application user
+          ansible.builtin.user:
+            name: "{{ app_user }}"
+            system: true
+            shell: /usr/sbin/nologin
+            home: "{{ app_dir }}"
+            create_home: false
+
+        - name: Create application directory
+          ansible.builtin.file:
+            path: "{{ app_dir }}"
+            state: directory
+            owner: "{{ app_user }}"
+            group: "{{ app_user }}"
+            mode: "0755"
+
+        - name: Create static and media directories
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: directory
+            owner: "{{ app_user }}"
+            group: "{{ app_user }}"
+            mode: "0755"
+          loop:
+            - "{{ static_root }}"
+            - "{{ media_root }}"
+
+    # ------------------------------------------------------------------
+    # Application code deployment
+    # ------------------------------------------------------------------
+    - name: Deploy Django application
+      tags:
+        - deploy
+      block:
+        - name: Clone or update application repository
+          ansible.builtin.git:
+            repo: "{{ git_repo }}"
+            dest: "{{ app_dir }}"
+            version: "{{ git_branch }}"
+            force: true
+          become_user: "{{ app_user }}"
+          register: git_result
+          notify: "restart app"
+
+        - name: Create Python virtual environment
+          ansible.builtin.command:
+            cmd: "{{ python_version }} -m venv {{ venv_dir }}"
+            creates: "{{ venv_dir }}/bin/activate"
+          become_user: "{{ app_user }}"
+
+        - name: Upgrade pip in virtual environment
+          ansible.builtin.pip:
+            name:
+              - pip
+              - setuptools
+              - wheel
+            state: latest
+            virtualenv: "{{ venv_dir }}"
+          become_user: "{{ app_user }}"
+
+        - name: Install application requirements
+          ansible.builtin.pip:
+            requirements: "{{ app_dir }}/requirements.txt"
+            virtualenv: "{{ venv_dir }}"
+          become_user: "{{ app_user }}"
+          notify: "restart app"
+
+        - name: Install gunicorn and psycopg2 in virtual environment
+          ansible.builtin.pip:
+            name:
+              - gunicorn
+              - psycopg2
+            state: present
+            virtualenv: "{{ venv_dir }}"
+          become_user: "{{ app_user }}"
+
+    # ------------------------------------------------------------------
+    # Django management commands
+    # ------------------------------------------------------------------
+    - name: Run Django management commands
+      tags:
+        - deploy
+        - django
+      block:
+        - name: Run Django collectstatic
+          ansible.builtin.command:
+            cmd: "{{ venv_dir }}/bin/python manage.py collectstatic --noinput"
+            chdir: "{{ app_dir }}"
+          become_user: "{{ app_user }}"
+          environment:
+            DJANGO_SETTINGS_MODULE: "{{ django_settings_module }}"
+            DATABASE_URL: "postgres://{{ db_user }}:{{ db_password }}@{{ db_host }}/{{ db_name }}"
+            SECRET_KEY: "{{ django_secret_key }}"
+            ALLOWED_HOSTS: "{{ allowed_hosts }}"
+          changed_when: true
+
+        - name: Run Django database migrations
+          ansible.builtin.command:
+            cmd: "{{ venv_dir }}/bin/python manage.py migrate --noinput"
+            chdir: "{{ app_dir }}"
+          become_user: "{{ app_user }}"
+          environment:
+            DJANGO_SETTINGS_MODULE: "{{ django_settings_module }}"
+            DATABASE_URL: "postgres://{{ db_user }}:{{ db_password }}@{{ db_host }}/{{ db_name }}"
+            SECRET_KEY: "{{ django_secret_key }}"
+            ALLOWED_HOSTS: "{{ allowed_hosts }}"
+          changed_when: true
+
+    # ------------------------------------------------------------------
+    # Systemd service
+    # ------------------------------------------------------------------
+    - name: Configure Gunicorn systemd service
+      tags:
+        - service
+        - systemd
+      block:
+        - name: Deploy Gunicorn systemd service unit
+          ansible.builtin.template:
+            src: gunicorn.service.j2
+            dest: "/etc/systemd/system/{{ app_name }}.service"
+            owner: root
+            group: root
+            mode: "0644"
+          notify:
+            - "reload systemd"
+            - "restart app"
+
+        - name: Enable and start Django/Gunicorn service
+          ansible.builtin.systemd:
+            name: "{{ app_name }}"
+            enabled: true
+            state: started
+            daemon_reload: true
+
+    # ------------------------------------------------------------------
+    # Nginx reverse proxy
+    # ------------------------------------------------------------------
+    - name: Configure Nginx reverse proxy
+      tags:
+        - nginx
+        - proxy
+      block:
+        - name: Remove default nginx site
+          ansible.builtin.file:
+            path: /etc/nginx/sites-enabled/default
+            state: absent
+          notify: "reload nginx"
+
+        - name: Deploy Nginx configuration for Django
+          ansible.builtin.template:
+            src: django_nginx.conf.j2
+            dest: "/etc/nginx/sites-available/{{ app_name }}.conf"
+            owner: root
+            group: root
+            mode: "0644"
+          notify: "reload nginx"
+
+        - name: Enable Nginx site configuration
+          ansible.builtin.file:
+            src: "/etc/nginx/sites-available/{{ app_name }}.conf"
+            dest: "/etc/nginx/sites-enabled/{{ app_name }}.conf"
+            state: link
+          notify: "reload nginx"
+
+        - name: Validate Nginx configuration
+          ansible.builtin.command:
+            cmd: nginx -t
+          changed_when: false
+
+        - name: Ensure Nginx is enabled and running
+          ansible.builtin.systemd:
+            name: nginx
+            enabled: true
+            state: started
+
+    # ------------------------------------------------------------------
+    # Verification
+    # ------------------------------------------------------------------
+    - name: Verify Django deployment
+      tags:
+        - verify
+      block:
+        - name: Wait for application to become available
+          ansible.builtin.uri:
+            url: "http://localhost:{{ app_port }}/"
+            method: GET
+            status_code:
+              - 200
+              - 301
+              - 302
+              - 400
+          register: health_check
+          retries: 10
+          delay: 3
+          until: health_check is not failed
+
+        - name: Display deployment result
+          ansible.builtin.debug:
+            msg: "{{ app_name }} (Django) deployed successfully on port {{ app_port }}"

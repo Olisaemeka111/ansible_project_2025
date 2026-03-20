@@ -1,0 +1,37 @@
+[Unit]
+Description={{ app_name }} Meteor.js Application
+After=network.target mongod.service
+
+[Service]
+Type=simple
+User={{ app_user | default(app_name) }}
+Group={{ app_user | default(app_name) }}
+WorkingDirectory={{ app_dir }}/bundle
+ExecStart=/usr/bin/node main.js
+Restart=always
+RestartSec=10
+
+# Meteor environment
+Environment="NODE_ENV=production"
+Environment="ROOT_URL={{ root_url | default('http://localhost:' + (app_port | default(3000) | string)) }}"
+Environment="MONGO_URL={{ mongo_url | default('mongodb://localhost:27017/' + app_name) }}"
+Environment="PORT={{ app_port | default(3000) }}"
+{% if meteor_settings is defined %}
+Environment="METEOR_SETTINGS={{ meteor_settings | to_json }}"
+{% endif %}
+{% if mail_url is defined %}
+Environment="MAIL_URL={{ mail_url }}"
+{% endif %}
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier={{ app_name }}
+
+# Security
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

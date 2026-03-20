@@ -1,0 +1,45 @@
+# Nginx configuration for Laravel
+server {
+    listen 80;
+    server_name {{ server_name | default('_') }};
+    root {{ app_dir | default('/var/www/' + app_name) }}/public;
+    index index.php index.html;
+
+    client_max_body_size 64M;
+
+    # Laravel pretty URLs
+    location / {
+        try_files $uri $uri/ /index.php?$query_string;
+    }
+
+    # PHP-FPM processing
+    location ~ \.php$ {
+        fastcgi_split_path_info ^(.+\.php)(/.+)$;
+        fastcgi_pass unix:/run/php/php{{ php_version | default('8.2') }}-fpm.sock;
+        fastcgi_index index.php;
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        include fastcgi_params;
+
+        fastcgi_buffering on;
+        fastcgi_buffer_size 16k;
+        fastcgi_buffers 16 16k;
+    }
+
+    # Cache static assets
+    location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot)$ {
+        expires 30d;
+        add_header Cache-Control "public, immutable";
+    }
+
+    # Deny access to hidden files
+    location ~ /\.ht {
+        deny all;
+    }
+
+    location ~ /\.env {
+        deny all;
+    }
+
+    access_log /var/log/nginx/{{ app_name }}_access.log;
+    error_log /var/log/nginx/{{ app_name }}_error.log;
+}

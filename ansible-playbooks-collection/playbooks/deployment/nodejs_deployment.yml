@@ -1,0 +1,181 @@
+---
+# Playbook: Deploy Node.js Application
+# Description: Installs Node.js 20.x via NodeSource, clones application repo,
+#              installs dependencies, and configures a systemd service.
+# Requirements: Ubuntu 22.04 target hosts, git repo accessible from targets
+# Tags: nodejs, deploy, application
+
+- name: Deploy Node.js Application
+  hosts: all
+  become: true
+
+  vars:
+    app_name: "myapp"
+    app_dir: "/opt/{{ app_name }}"
+    app_port: 3000
+    app_user: "nodeapp"
+    node_env: "production"
+    git_repo: ""
+    git_branch: "main"
+    nodejs_version: "20"
+    app_entry_point: "app.js"
+
+  handlers:
+    - name: Restart {{ app_name }}
+      ansible.builtin.systemd:
+        name: "{{ app_name }}"
+        state: restarted
+        daemon_reload: true
+      listen: "restart app"
+
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+      listen: "reload systemd"
+
+  tasks:
+    # ------------------------------------------------------------------
+    # Node.js installation
+    # ------------------------------------------------------------------
+    - name: Install Node.js 20.x repository and runtime
+      tags:
+        - nodejs
+        - setup
+      block:
+        - name: Install prerequisites
+          ansible.builtin.apt:
+            name:
+              - ca-certificates
+              - curl
+              - gnupg
+            state: present
+            update_cache: true
+
+        - name: Create keyrings directory
+          ansible.builtin.file:
+            path: /etc/apt/keyrings
+            state: directory
+            mode: "0755"
+
+        - name: Download NodeSource GPG key
+          ansible.builtin.get_url:
+            url: "https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key"
+            dest: /tmp/nodesource.gpg.key
+            mode: "0644"
+
+        - name: De-armor and install NodeSource GPG key
+          ansible.builtin.shell:
+            cmd: gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg < /tmp/nodesource.gpg.key
+            creates: /etc/apt/keyrings/nodesource.gpg
+
+        - name: Add NodeSource repository
+          ansible.builtin.apt_repository:
+            repo: "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_{{ nodejs_version }}.x nodistro main"
+            filename: nodesource
+            state: present
+
+        - name: Install Node.js
+          ansible.builtin.apt:
+            name: nodejs
+            state: present
+            update_cache: true
+
+    # ------------------------------------------------------------------
+    # Application user and directory setup
+    # ------------------------------------------------------------------
+    - name: Configure application user and directory
+      tags:
+        - setup
+        - user
+      block:
+        - name: Create application user
+          ansible.builtin.user:
+            name: "{{ app_user }}"
+            system: true
+            shell: /usr/sbin/nologin
+            home: "{{ app_dir }}"
+            create_home: false
+
+        - name: Create application directory
+          ansible.builtin.file:
+            path: "{{ app_dir }}"
+            state: directory
+            owner: "{{ app_user }}"
+            group: "{{ app_user }}"
+            mode: "0755"
+
+    # ------------------------------------------------------------------
+    # Application deployment
+    # ------------------------------------------------------------------
+    - name: Deploy application code and dependencies
+      tags:
+        - deploy
+      block:
+        - name: Clone or update application repository
+          ansible.builtin.git:
+            repo: "{{ git_repo }}"
+            dest: "{{ app_dir }}"
+            version: "{{ git_branch }}"
+            force: true
+          become_user: "{{ app_user }}"
+          notify: "restart app"
+
+        - name: Install application dependencies with npm ci
+          community.general.npm:
+            path: "{{ app_dir }}"
+            ci: true
+            production: true
+          become_user: "{{ app_user }}"
+          environment:
+            NODE_ENV: "{{ node_env }}"
+          notify: "restart app"
+
+    # ------------------------------------------------------------------
+    # Systemd service configuration
+    # ------------------------------------------------------------------
+    - name: Configure systemd service
+      tags:
+        - service
+        - systemd
+      block:
+        - name: Deploy systemd service unit
+          ansible.builtin.template:
+            src: nodejs.service.j2
+            dest: "/etc/systemd/system/{{ app_name }}.service"
+            owner: root
+            group: root
+            mode: "0644"
+          notify:
+            - "reload systemd"
+            - "restart app"
+
+        - name: Enable and start application service
+          ansible.builtin.systemd:
+            name: "{{ app_name }}"
+            enabled: true
+            state: started
+            daemon_reload: true
+
+    # ------------------------------------------------------------------
+    # Verification
+    # ------------------------------------------------------------------
+    - name: Verify application is running
+      tags:
+        - verify
+      block:
+        - name: Wait for application to become available
+          ansible.builtin.uri:
+            url: "http://localhost:{{ app_port }}/"
+            method: GET
+            status_code:
+              - 200
+              - 301
+              - 302
+          register: health_check
+          retries: 10
+          delay: 3
+          until: health_check is not failed
+
+        - name: Display deployment result
+          ansible.builtin.debug:
+            msg: "{{ app_name }} deployed successfully on port {{ app_port }}"

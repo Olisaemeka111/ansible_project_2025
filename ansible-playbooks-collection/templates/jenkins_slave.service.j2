@@ -1,0 +1,67 @@
+# Ansible managed - Systemd service unit for Jenkins agent (slave)
+# Template: jenkins_slave.service.j2
+#
+# Variables:
+#   jenkins_agent_name    - Agent display name
+#   jenkins_master_url    - Jenkins master URL (e.g., https://jenkins.example.com)
+#   jenkins_agent_secret  - Agent secret/token for JNLP authentication
+#   jenkins_agent_dir     - Agent working directory (default: /var/lib/jenkins)
+#   jenkins_agent_user    - User to run the agent as (default: jenkins)
+#   jenkins_agent_group   - Group to run the agent as (default: jenkins)
+#   jenkins_java_bin      - Path to java binary (default: /usr/bin/java)
+#   jenkins_java_opts     - Additional JVM options (default: -Xmx512m)
+#   jenkins_agent_jar     - Path to agent.jar (default: /var/lib/jenkins/agent.jar)
+
+[Unit]
+Description=Jenkins Agent - {{ jenkins_agent_name | default('agent') }}
+Documentation=https://www.jenkins.io/doc/book/using/using-agents/
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# User and group
+User={{ jenkins_agent_user | default('jenkins') }}
+Group={{ jenkins_agent_group | default('jenkins') }}
+
+# Working directory for builds and workspace
+WorkingDirectory={{ jenkins_agent_dir | default('/var/lib/jenkins') }}
+
+# Start the Jenkins agent via JNLP
+# The agent.jar connects back to the Jenkins master using the secret and URL
+ExecStart={{ jenkins_java_bin | default('/usr/bin/java') }} \
+    {{ jenkins_java_opts | default('-Xmx512m') }} \
+    -jar {{ jenkins_agent_jar | default('/var/lib/jenkins/agent.jar') }} \
+    -jnlpUrl {{ jenkins_master_url }}/computer/{{ jenkins_agent_name }}/jenkins-agent.jnlp \
+    -secret {{ jenkins_agent_secret }} \
+    -workDir "{{ jenkins_agent_dir | default('/var/lib/jenkins') }}"
+
+# Restart policy - always restart to maintain connectivity with master
+Restart=always
+RestartSec=10
+
+# Allow time for graceful shutdown of running builds
+TimeoutStopSec=120
+
+# Standard output and error logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=jenkins-agent-{{ jenkins_agent_name | default('agent') }}
+
+# File descriptor limit for build processes
+LimitNOFILE={{ jenkins_nofile_limit | default(65536) }}
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+
+{% if jenkins_agent_env is defined %}
+# Additional environment variables
+{% for key, value in jenkins_agent_env.items() %}
+Environment={{ key }}={{ value }}
+{% endfor %}
+{% endif %}
+
+[Install]
+WantedBy=multi-user.target

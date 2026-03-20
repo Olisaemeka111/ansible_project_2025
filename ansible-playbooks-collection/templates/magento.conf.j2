@@ -1,0 +1,98 @@
+# Nginx configuration for Magento 2
+upstream fastcgi_backend {
+    server unix:/run/php/php{{ php_version | default('8.2') }}-fpm.sock;
+}
+
+server {
+    listen 80;
+    server_name {{ domain | default('_') }};
+    set $MAGE_ROOT {{ app_dir | default('/var/www/magento') }};
+    set $MAGE_MODE {{ mage_mode | default('production') }};
+
+    root $MAGE_ROOT/pub;
+    index index.php;
+
+    autoindex off;
+    charset UTF-8;
+    client_max_body_size 64M;
+
+    error_page 404 403 = /errors/404.php;
+
+    # Deny access to sensitive files
+    location /.user.ini {
+        deny all;
+    }
+    location ~ /\.ht {
+        deny all;
+    }
+    location ~ /\.git {
+        deny all;
+    }
+
+    # Static content
+    location /static/ {
+        expires max;
+
+        location ~ ^/static/version\d*/ {
+            rewrite ^/static/version\d*/(.*)$ /static/$1 last;
+        }
+
+        location ~* \.(ico|jpg|jpeg|png|gif|svg|svgz|webp|avif|avifs|js|css|eot|ttf|otf|woff|woff2|html|json)$ {
+            add_header Cache-Control "public";
+            add_header X-Frame-Options "SAMEORIGIN";
+            expires +1y;
+            if (!-f $request_filename) {
+                rewrite ^/static/(version\d*/)?(.*)$ /static.php?resource=$2 last;
+            }
+        }
+    }
+
+    # Media content
+    location /media/ {
+        try_files $uri $uri/ /get.php$is_args$args;
+
+        location ~ ^/media/theme_customization/.*\.xml {
+            deny all;
+        }
+
+        location ~* \.(ico|jpg|jpeg|png|gif|svg|svgz|webp|avif|avifs|js|css|eot|ttf|otf|woff|woff2)$ {
+            add_header Cache-Control "public";
+            expires +1y;
+            try_files $uri $uri/ /get.php$is_args$args;
+        }
+    }
+
+    # PHP entry point for main application
+    location ~ ^/(index|get|static|errors/report|errors/404|errors/503|health_check)\.php$ {
+        try_files $uri =404;
+        fastcgi_pass fastcgi_backend;
+        fastcgi_buffers 1024 4k;
+        fastcgi_param PHP_FLAG "session.auto_start=off \n suhosin.session.cryptua=off";
+        fastcgi_param PHP_VALUE "memory_limit=756M \n max_execution_time=18000";
+        fastcgi_read_timeout 600s;
+        fastcgi_connect_timeout 600s;
+        fastcgi_index index.php;
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        fastcgi_param MAGE_MODE $MAGE_MODE;
+        include fastcgi_params;
+    }
+
+    # Deny all other PHP files
+    location ~ \.php$ {
+        return 404;
+    }
+
+    # Gzip compression
+    gzip on;
+    gzip_disable "msie6";
+    gzip_comp_level 6;
+    gzip_min_length 1100;
+    gzip_buffers 16 8k;
+    gzip_types
+        text/plain text/css text/js text/xml text/javascript
+        application/javascript application/x-javascript application/json
+        application/xml application/rss+xml image/svg+xml;
+
+    access_log /var/log/nginx/magento_access.log;
+    error_log /var/log/nginx/magento_error.log;
+}

@@ -1,0 +1,178 @@
+---
+- name: Deploy Kubernetes Dashboard
+  hosts: all
+  become: true
+
+  vars:
+    k8s_dashboard_version: "v2.7.0"
+    namespace: kubernetes-dashboard
+    admin_user: dashboard-admin
+    kubeconfig: /etc/kubernetes/admin.conf
+
+  tasks:
+    # ========================================================================
+    # PREREQUISITES
+    # ========================================================================
+    - name: Verify kubectl is installed
+      ansible.builtin.command: kubectl version --client --short
+      register: kubectl_check
+      changed_when: false
+      tags: [validate]
+
+    - name: Verify cluster connectivity
+      ansible.builtin.command: kubectl cluster-info
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: cluster_check
+      changed_when: false
+      tags: [validate]
+
+    # ========================================================================
+    # DEPLOY DASHBOARD
+    # ========================================================================
+    - name: Apply Kubernetes Dashboard manifest
+      ansible.builtin.command: >
+        kubectl apply -f
+        https://raw.githubusercontent.com/kubernetes/dashboard/{{ k8s_dashboard_version }}/aio/deploy/recommended.yaml
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: dashboard_apply
+      changed_when: "'created' in dashboard_apply.stdout or 'configured' in dashboard_apply.stdout"
+      tags: [deploy]
+
+    # ========================================================================
+    # ADMIN SERVICE ACCOUNT
+    # ========================================================================
+    - name: Create admin ServiceAccount manifest
+      ansible.builtin.copy:
+        dest: /tmp/dashboard-admin-sa.yml
+        content: |
+          apiVersion: v1
+          kind: ServiceAccount
+          metadata:
+            name: {{ admin_user }}
+            namespace: {{ namespace }}
+        mode: "0644"
+      tags: [auth]
+
+    - name: Create ClusterRoleBinding manifest
+      ansible.builtin.copy:
+        dest: /tmp/dashboard-admin-crb.yml
+        content: |
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRoleBinding
+          metadata:
+            name: {{ admin_user }}-binding
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: cluster-admin
+          subjects:
+            - kind: ServiceAccount
+              name: {{ admin_user }}
+              namespace: {{ namespace }}
+        mode: "0644"
+      tags: [auth]
+
+    - name: Create admin secret manifest
+      ansible.builtin.copy:
+        dest: /tmp/dashboard-admin-secret.yml
+        content: |
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: {{ admin_user }}-secret
+            namespace: {{ namespace }}
+            annotations:
+              kubernetes.io/service-account.name: {{ admin_user }}
+          type: kubernetes.io/service-account-token
+        mode: "0644"
+      tags: [auth]
+
+    - name: Apply admin ServiceAccount
+      ansible.builtin.command: kubectl apply -f /tmp/dashboard-admin-sa.yml
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: sa_apply
+      changed_when: "'created' in sa_apply.stdout or 'configured' in sa_apply.stdout"
+      tags: [auth]
+
+    - name: Apply ClusterRoleBinding
+      ansible.builtin.command: kubectl apply -f /tmp/dashboard-admin-crb.yml
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: crb_apply
+      changed_when: "'created' in crb_apply.stdout or 'configured' in crb_apply.stdout"
+      tags: [auth]
+
+    - name: Apply admin secret
+      ansible.builtin.command: kubectl apply -f /tmp/dashboard-admin-secret.yml
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: secret_apply
+      changed_when: "'created' in secret_apply.stdout or 'configured' in secret_apply.stdout"
+      tags: [auth]
+
+    # ========================================================================
+    # GET TOKEN
+    # ========================================================================
+    - name: Wait for dashboard pods to be ready
+      ansible.builtin.command: >
+        kubectl wait --for=condition=ready pod
+        -l k8s-app=kubernetes-dashboard
+        -n {{ namespace }}
+        --timeout=120s
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      changed_when: false
+      tags: [verify]
+
+    - name: Get admin bearer token
+      ansible.builtin.command: >
+        kubectl get secret {{ admin_user }}-secret
+        -n {{ namespace }}
+        -o jsonpath='{.data.token}'
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: admin_token_raw
+      changed_when: false
+      tags: [verify]
+
+    - name: Decode token
+      ansible.builtin.command: "echo {{ admin_token_raw.stdout }} | base64 -d"
+      register: admin_token
+      changed_when: false
+      tags: [verify]
+
+    # ========================================================================
+    # CLEANUP & OUTPUT
+    # ========================================================================
+    - name: Remove temporary manifests
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /tmp/dashboard-admin-sa.yml
+        - /tmp/dashboard-admin-crb.yml
+        - /tmp/dashboard-admin-secret.yml
+      tags: [cleanup]
+
+    - name: Display Kubernetes Dashboard access info
+      ansible.builtin.debug:
+        msg: |
+          Kubernetes Dashboard deployed successfully!
+
+          Version: {{ k8s_dashboard_version }}
+          Namespace: {{ namespace }}
+
+          Access via kubectl proxy:
+            kubectl proxy
+            URL: http://localhost:8001/api/v1/namespaces/{{ namespace }}/services/https:kubernetes-dashboard:/proxy/
+
+          Access via NodePort (edit service type):
+            kubectl -n {{ namespace }} edit svc kubernetes-dashboard
+            Change type: ClusterIP to type: NodePort
+
+          Bearer Token for login:
+            {{ admin_token.stdout }}
+      tags: [verify]

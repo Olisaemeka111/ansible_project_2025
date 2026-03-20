@@ -1,0 +1,286 @@
+---
+# Ansible Playbook: Prometheus Node Exporter Setup
+# Installs and configures Node Exporter for system metrics collection.
+# Usage: ansible-playbook monitoring_setup.yml --limit all
+
+- name: Install Prometheus Node Exporter and configure monitoring
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    node_exporter_version: "1.8.2"
+    node_exporter_listen_address: "0.0.0.0"
+    node_exporter_port: 9100
+    node_exporter_user: "node_exporter"
+    node_exporter_group: "node_exporter"
+    node_exporter_install_dir: "/usr/local/bin"
+    node_exporter_textfile_dir: "/var/lib/node_exporter/textfile_collector"
+    node_exporter_enabled_collectors:
+      - systemd
+      - textfile
+      - filesystem
+      - meminfo
+      - cpu
+      - diskstats
+      - netdev
+      - loadavg
+    node_exporter_disabled_collectors: []
+    node_exporter_tls_enabled: false
+    node_exporter_tls_cert: ""
+    node_exporter_tls_key: ""
+    node_exporter_arch_map:
+      x86_64: "amd64"
+      aarch64: "arm64"
+      armv7l: "armv7"
+    node_exporter_firewall_enabled: true
+    node_exporter_firewall_allowed_from: "any"
+
+  handlers:
+    - name: Restart node_exporter service
+      ansible.builtin.systemd:
+        name: node_exporter
+        state: restarted
+        daemon_reload: true
+
+    - name: Reload systemd daemon
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+  tasks:
+    - name: Set architecture variable
+      tags: [install]
+      ansible.builtin.set_fact:
+        node_exporter_arch: "{{ node_exporter_arch_map[ansible_architecture] | default('amd64') }}"
+
+    - name: Create Node Exporter system user
+      tags: [install]
+      block:
+        - name: Create node_exporter group
+          ansible.builtin.group:
+            name: "{{ node_exporter_group }}"
+            system: true
+            state: present
+
+        - name: Create node_exporter user
+          ansible.builtin.user:
+            name: "{{ node_exporter_user }}"
+            group: "{{ node_exporter_group }}"
+            shell: /usr/sbin/nologin
+            system: true
+            create_home: false
+            home: /nonexistent
+            comment: "Prometheus Node Exporter service account"
+
+    - name: Download and install Node Exporter
+      tags: [install]
+      block:
+        - name: Check if node_exporter is already installed at desired version
+          ansible.builtin.command:
+            cmd: "{{ node_exporter_install_dir }}/node_exporter --version"
+          changed_when: false
+          failed_when: false
+          register: node_exporter_current_version
+
+        - name: Set download required fact
+          ansible.builtin.set_fact:
+            node_exporter_download_required: >-
+              {{ node_exporter_current_version.rc != 0 or
+                 node_exporter_version not in (node_exporter_current_version.stdout | default('')) }}
+
+        - name: Create temporary download directory
+          ansible.builtin.tempfile:
+            state: directory
+            prefix: node_exporter_
+          register: node_exporter_tmpdir
+          when: node_exporter_download_required | bool
+
+        - name: Download Node Exporter binary
+          ansible.builtin.get_url:
+            url: "https://github.com/prometheus/node_exporter/releases/download/v{{ node_exporter_version }}/node_exporter-{{ node_exporter_version }}.linux-{{ node_exporter_arch }}.tar.gz"
+            dest: "{{ node_exporter_tmpdir.path }}/node_exporter.tar.gz"
+            mode: "0644"
+            checksum: "sha256:https://github.com/prometheus/node_exporter/releases/download/v{{ node_exporter_version }}/sha256sums.txt"
+          when: node_exporter_download_required | bool
+
+        - name: Extract Node Exporter archive
+          ansible.builtin.unarchive:
+            src: "{{ node_exporter_tmpdir.path }}/node_exporter.tar.gz"
+            dest: "{{ node_exporter_tmpdir.path }}"
+            remote_src: true
+          when: node_exporter_download_required | bool
+
+        - name: Install Node Exporter binary
+          ansible.builtin.copy:
+            src: "{{ node_exporter_tmpdir.path }}/node_exporter-{{ node_exporter_version }}.linux-{{ node_exporter_arch }}/node_exporter"
+            dest: "{{ node_exporter_install_dir }}/node_exporter"
+            remote_src: true
+            owner: root
+            group: root
+            mode: "0755"
+          when: node_exporter_download_required | bool
+          notify: Restart node_exporter service
+
+        - name: Clean up temporary download directory
+          ansible.builtin.file:
+            path: "{{ node_exporter_tmpdir.path }}"
+            state: absent
+          when: node_exporter_download_required | bool
+
+    - name: Create required directories
+      tags: [configure]
+      block:
+        - name: Create textfile collector directory
+          ansible.builtin.file:
+            path: "{{ node_exporter_textfile_dir }}"
+            state: directory
+            owner: "{{ node_exporter_user }}"
+            group: "{{ node_exporter_group }}"
+            mode: "0755"
+
+    - name: Configure Node Exporter TLS (optional)
+      tags: [configure, security]
+      block:
+        - name: Create Node Exporter config directory
+          ansible.builtin.file:
+            path: /etc/node_exporter
+            state: directory
+            owner: "{{ node_exporter_user }}"
+            group: "{{ node_exporter_group }}"
+            mode: "0750"
+
+        - name: Deploy Node Exporter web config for TLS
+          ansible.builtin.copy:
+            content: |
+              # Node Exporter web configuration
+              # Managed by Ansible - do not edit manually
+              tls_server_config:
+                cert_file: {{ node_exporter_tls_cert }}
+                key_file: {{ node_exporter_tls_key }}
+            dest: /etc/node_exporter/web-config.yml
+            owner: "{{ node_exporter_user }}"
+            group: "{{ node_exporter_group }}"
+            mode: "0640"
+          when: node_exporter_tls_enabled | bool
+          notify: Restart node_exporter service
+
+    - name: Create systemd service for Node Exporter
+      tags: [configure, service]
+      block:
+        - name: Deploy Node Exporter systemd service file
+          ansible.builtin.copy:
+            content: |
+              # Node Exporter systemd service
+              # Managed by Ansible - do not edit manually
+              [Unit]
+              Description=Prometheus Node Exporter
+              Documentation=https://github.com/prometheus/node_exporter
+              After=network-online.target
+              Wants=network-online.target
+
+              [Service]
+              Type=simple
+              User={{ node_exporter_user }}
+              Group={{ node_exporter_group }}
+              ExecStart={{ node_exporter_install_dir }}/node_exporter \
+                --web.listen-address={{ node_exporter_listen_address }}:{{ node_exporter_port }} \
+                --collector.textfile.directory={{ node_exporter_textfile_dir }} \
+              {% for collector in node_exporter_enabled_collectors %}
+                --collector.{{ collector }} \
+              {% endfor %}
+              {% for collector in node_exporter_disabled_collectors %}
+                --no-collector.{{ collector }} \
+              {% endfor %}
+              {% if node_exporter_tls_enabled %}
+                --web.config.file=/etc/node_exporter/web-config.yml \
+              {% endif %}
+                --log.level=info
+
+              SyslogIdentifier=node_exporter
+              Restart=always
+              RestartSec=5
+
+              # Security hardening
+              NoNewPrivileges=yes
+              ProtectHome=yes
+              ProtectSystem=strict
+              ProtectControlGroups=yes
+              ProtectKernelModules=yes
+              ProtectKernelTunables=yes
+              ReadWritePaths={{ node_exporter_textfile_dir }}
+
+              [Install]
+              WantedBy=multi-user.target
+            dest: /etc/systemd/system/node_exporter.service
+            owner: root
+            group: root
+            mode: "0644"
+          notify:
+            - Reload systemd daemon
+            - Restart node_exporter service
+
+    - name: Start and enable Node Exporter service
+      tags: [service]
+      ansible.builtin.systemd:
+        name: node_exporter
+        state: started
+        enabled: true
+        daemon_reload: true
+
+    - name: Configure firewall for Node Exporter
+      tags: [firewall]
+      community.general.ufw:
+        rule: allow
+        port: "{{ node_exporter_port | string }}"
+        proto: tcp
+        from_ip: "{{ node_exporter_firewall_allowed_from }}"
+        comment: "Prometheus Node Exporter"
+      when: node_exporter_firewall_enabled | bool
+
+    - name: Verify Node Exporter installation
+      tags: [verify]
+      block:
+        - name: Wait for Node Exporter to start
+          ansible.builtin.wait_for:
+            port: "{{ node_exporter_port }}"
+            host: "{{ node_exporter_listen_address if node_exporter_listen_address != '0.0.0.0' else '127.0.0.1' }}"
+            timeout: 30
+
+        - name: Get Node Exporter version
+          ansible.builtin.command:
+            cmd: "{{ node_exporter_install_dir }}/node_exporter --version"
+          changed_when: false
+          register: node_exporter_version_output
+
+        - name: Display Node Exporter version
+          ansible.builtin.debug:
+            msg: "{{ node_exporter_version_output.stderr_lines | default(node_exporter_version_output.stdout_lines) }}"
+
+        - name: Verify metrics endpoint is accessible
+          ansible.builtin.uri:
+            url: "http://{{ node_exporter_listen_address if node_exporter_listen_address != '0.0.0.0' else 'localhost' }}:{{ node_exporter_port }}/metrics"
+            return_content: true
+            status_code: 200
+          register: metrics_response
+          retries: 5
+          delay: 3
+          until: metrics_response is not failed
+
+        - name: Verify key metrics are present
+          ansible.builtin.assert:
+            that:
+              - "'node_cpu_seconds_total' in metrics_response.content"
+              - "'node_memory_MemTotal_bytes' in metrics_response.content"
+              - "'node_filesystem_size_bytes' in metrics_response.content"
+            success_msg: "Node Exporter is serving metrics correctly on port {{ node_exporter_port }}"
+            fail_msg: "Node Exporter metrics endpoint is not returning expected metrics"
+
+        - name: Display service status
+          ansible.builtin.command:
+            cmd: systemctl status node_exporter --no-pager
+          changed_when: false
+          register: service_status
+
+        - name: Show service status
+          ansible.builtin.debug:
+            msg: "{{ service_status.stdout_lines }}"

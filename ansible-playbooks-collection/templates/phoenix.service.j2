@@ -1,0 +1,41 @@
+[Unit]
+Description={{ app_name }} Phoenix Application
+After=network.target postgresql.service
+
+[Service]
+Type=exec
+User={{ app_user | default(app_name) }}
+Group={{ app_user | default(app_name) }}
+WorkingDirectory={{ app_dir }}
+ExecStart={{ app_dir }}/bin/{{ app_name }} start
+ExecStop={{ app_dir }}/bin/{{ app_name }} stop
+Restart=always
+RestartSec=5
+
+# Phoenix/Elixir environment
+Environment="MIX_ENV=prod"
+Environment="PHX_HOST={{ phx_host | default('localhost') }}"
+Environment="PHX_SERVER=true"
+Environment="PORT={{ app_port | default(4000) }}"
+Environment="SECRET_KEY_BASE={{ secret_key_base }}"
+Environment="DATABASE_URL={{ database_url }}"
+{% if pool_size is defined %}
+Environment="POOL_SIZE={{ pool_size }}"
+{% endif %}
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier={{ app_name }}
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+
+# BEAM VM may need higher limits
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

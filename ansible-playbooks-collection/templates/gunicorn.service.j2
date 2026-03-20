@@ -1,0 +1,108 @@
+# Ansible managed - Systemd service unit for Gunicorn (Django)
+# Template: gunicorn.service.j2
+#
+# Variables:
+#   app_name              - Application/project name (default: django-app)
+#   app_dir               - Django project directory (default: /opt/{{ app_name }})
+#   app_user              - User to run the service (default: www-data)
+#   app_group             - Group to run the service (default: www-data)
+#   app_port              - Application port (default: 8000)
+#   venv_dir              - Virtualenv directory (default: {{ app_dir }}/venv)
+#   django_settings       - Django settings module (default: {{ app_name }}.settings)
+#   gunicorn_workers      - Number of worker processes (default: 4)
+#   gunicorn_threads      - Threads per worker (default: 2)
+#   gunicorn_timeout      - Worker timeout in seconds (default: 120)
+#   gunicorn_worker_class - Worker class: sync, gevent, uvicorn.workers.UvicornWorker (default: sync)
+#   django_extra_env      - Dict of additional environment variables (optional)
+
+[Unit]
+Description={{ app_name | default('django-app') }} Django Application (Gunicorn)
+Documentation=https://docs.gunicorn.org/
+After=network.target
+{% if requires_redis | default(false) %}
+After=redis.service
+{% endif %}
+{% if requires_postgresql | default(false) %}
+After=postgresql.service
+{% endif %}
+{% if requires_mysql | default(false) %}
+After=mysql.service
+{% endif %}
+Wants=network-online.target
+
+[Service]
+Type=notify
+NotifyAccess=all
+
+# User and group
+User={{ app_user | default('www-data') }}
+Group={{ app_group | default('www-data') }}
+
+# Working directory - Django project root
+WorkingDirectory={{ app_dir | default('/opt/' + app_name) }}
+
+# Environment variables
+Environment=DJANGO_SETTINGS_MODULE={{ django_settings | default(app_name + '.settings') }}
+{% if django_secret_key is defined %}
+Environment=DJANGO_SECRET_KEY={{ django_secret_key }}
+{% endif %}
+{% if database_url is defined %}
+Environment=DATABASE_URL={{ database_url }}
+{% endif %}
+{% if django_allowed_hosts is defined %}
+Environment=DJANGO_ALLOWED_HOSTS={{ django_allowed_hosts }}
+{% endif %}
+{% if django_extra_env is defined %}
+{% for key, value in django_extra_env.items() %}
+Environment={{ key }}={{ value }}
+{% endfor %}
+{% endif %}
+
+# Gunicorn start command with virtualenv python
+# Uses the full path to gunicorn inside the virtualenv
+ExecStart={{ venv_dir | default(app_dir | default('/opt/' + app_name) + '/venv') }}/bin/gunicorn \
+    --workers {{ gunicorn_workers | default(4) }} \
+    --threads {{ gunicorn_threads | default(2) }} \
+    --worker-class {{ gunicorn_worker_class | default('sync') }} \
+    --bind {{ gunicorn_bind | default('0.0.0.0:' + (app_port | default(8000) | string)) }} \
+    --timeout {{ gunicorn_timeout | default(120) }} \
+    --access-logfile {{ gunicorn_access_log | default('-') }} \
+    --error-logfile {{ gunicorn_error_log | default('-') }} \
+    --log-level {{ gunicorn_log_level | default('info') }} \
+{% if gunicorn_max_requests | default(0) > 0 %}
+    --max-requests {{ gunicorn_max_requests }} \
+    --max-requests-jitter {{ gunicorn_max_requests_jitter | default(50) }} \
+{% endif %}
+{% if gunicorn_worker_class | default('sync') == 'uvicorn.workers.UvicornWorker' %}
+    {{ app_name }}.asgi:application
+{% else %}
+    {{ app_name }}.wsgi:application
+{% endif %}
+
+# Reload command
+ExecReload=/bin/kill -s HUP $MAINPID
+
+# Restart policy
+Restart=always
+RestartSec=10
+
+# Graceful shutdown timeout
+TimeoutStopSec=30
+KillMode=mixed
+
+# Standard output and error
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier={{ app_name | default('django-app') }}-gunicorn
+
+# Resource limits
+LimitNOFILE={{ nofile_limit | default(65536) }}
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

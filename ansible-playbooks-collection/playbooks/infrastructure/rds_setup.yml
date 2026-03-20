@@ -1,0 +1,177 @@
+---
+# Playbook: Create AWS RDS Database Instance
+# Description: Provisions an RDS instance with a DB subnet group, supporting
+#              both MySQL and PostgreSQL engines with production-ready defaults.
+# Requirements:
+#   - ansible-galaxy collection install amazon.aws
+#   - AWS credentials configured
+#   - Existing VPC with private subnets (use vpc_setup.yml first)
+# Usage:
+#   ansible-playbook rds_setup.yml \
+#     -e "db_name=myappdb master_username=admin master_password=SecurePass123!"
+#   ansible-playbook rds_setup.yml -e "db_engine=postgres" --tags provision
+
+- name: Create AWS RDS Database Instance
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    aws_region: "us-east-2"
+    project_name: "infrastructure"
+    environment: "development"
+
+    # Database configuration
+    db_identifier: "ansible-managed-db"
+    db_engine: "mysql"                  # mysql or postgres
+    db_engine_version_mysql: "8.0"
+    db_engine_version_postgres: "16"
+    db_instance_class: "db.t3.medium"
+    db_name: ""
+    master_username: ""
+    master_password: ""                 # Use Ansible Vault in production
+    db_port_mysql: 3306
+    db_port_postgres: 5432
+
+    # Storage
+    allocated_storage: 20
+    max_allocated_storage: 100          # Enable storage autoscaling
+    storage_type: "gp3"
+    storage_encrypted: true
+
+    # High availability & backup
+    multi_az: false
+    backup_retention_period: 7
+    preferred_backup_window: "03:00-04:00"
+    preferred_maintenance_window: "sun:05:00-sun:06:00"
+    copy_tags_to_snapshot: true
+    deletion_protection: false          # Set true in production
+    skip_final_snapshot: true           # Set false in production
+    final_snapshot_identifier: "{{ db_identifier }}-final-snapshot"
+
+    # Networking - provide subnet IDs from your VPC
+    db_subnet_group_name: "{{ db_identifier }}-subnet-group"
+    db_subnet_ids: []                   # List of private subnet IDs
+    vpc_security_group_ids: []          # List of security group IDs
+
+    # Monitoring
+    enable_performance_insights: true
+    monitoring_interval: 60             # Enhanced monitoring interval in seconds
+
+    common_tags:
+      Project: "{{ project_name }}"
+      Environment: "{{ environment }}"
+      ManagedBy: "ansible"
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # Validation
+    # -------------------------------------------------------------------------
+    - name: Validate required variables
+      ansible.builtin.assert:
+        that:
+          - db_name | length > 0
+          - master_username | length > 0
+          - master_password | length > 0
+          - db_subnet_ids | length >= 2
+          - db_engine in ['mysql', 'postgres']
+        fail_msg: >-
+          Required variables: db_name, master_username, master_password, db_subnet_ids (min 2).
+          db_engine must be 'mysql' or 'postgres'.
+        success_msg: "All required variables are set."
+      tags:
+        - validate
+        - provision
+
+    - name: Set engine-specific variables
+      ansible.builtin.set_fact:
+        effective_engine: "{{ 'mysql' if db_engine == 'mysql' else 'postgres' }}"
+        effective_engine_version: "{{ db_engine_version_mysql if db_engine == 'mysql' else db_engine_version_postgres }}"
+        effective_port: "{{ db_port_mysql if db_engine == 'mysql' else db_port_postgres }}"
+      tags:
+        - provision
+
+    # -------------------------------------------------------------------------
+    # DB Subnet Group
+    # -------------------------------------------------------------------------
+    - name: Create DB subnet group
+      amazon.aws.rds_subnet_group:
+        name: "{{ db_subnet_group_name }}"
+        description: "Subnet group for {{ db_identifier }}"
+        subnets: "{{ db_subnet_ids }}"
+        region: "{{ aws_region }}"
+        tags: "{{ common_tags | combine({'Name': db_subnet_group_name}) }}"
+        state: present
+      register: subnet_group_result
+      tags:
+        - subnet_group
+        - provision
+
+    # -------------------------------------------------------------------------
+    # RDS Instance
+    # -------------------------------------------------------------------------
+    - name: Create RDS instance
+      amazon.aws.rds_instance:
+        db_instance_identifier: "{{ db_identifier }}"
+        engine: "{{ effective_engine }}"
+        engine_version: "{{ effective_engine_version }}"
+        db_instance_class: "{{ db_instance_class }}"
+        db_name: "{{ db_name }}"
+        master_username: "{{ master_username }}"
+        master_user_password: "{{ master_password }}"
+        allocated_storage: "{{ allocated_storage }}"
+        max_allocated_storage: "{{ max_allocated_storage }}"
+        storage_type: "{{ storage_type }}"
+        storage_encrypted: "{{ storage_encrypted }}"
+        multi_az: "{{ multi_az }}"
+        port: "{{ effective_port }}"
+        db_subnet_group_name: "{{ db_subnet_group_name }}"
+        vpc_security_group_ids: "{{ vpc_security_group_ids if vpc_security_group_ids | length > 0 else omit }}"
+        backup_retention_period: "{{ backup_retention_period }}"
+        preferred_backup_window: "{{ preferred_backup_window }}"
+        preferred_maintenance_window: "{{ preferred_maintenance_window }}"
+        copy_tags_to_snapshot: "{{ copy_tags_to_snapshot }}"
+        deletion_protection: "{{ deletion_protection }}"
+        skip_final_snapshot: "{{ skip_final_snapshot }}"
+        final_db_snapshot_identifier: "{{ final_snapshot_identifier if not skip_final_snapshot else omit }}"
+        enable_performance_insights: "{{ enable_performance_insights }}"
+        auto_minor_version_upgrade: true
+        publicly_accessible: false
+        region: "{{ aws_region }}"
+        tags: "{{ common_tags | combine({'Name': db_identifier}) }}"
+        wait: true
+        wait_timeout: 1800
+        state: present
+      register: rds_result
+      tags:
+        - provision
+
+    # -------------------------------------------------------------------------
+    # Results
+    # -------------------------------------------------------------------------
+    - name: Display RDS instance details
+      ansible.builtin.debug:
+        msg:
+          - "============================================="
+          - "  RDS Instance - Resource Summary"
+          - "============================================="
+          - "DB Identifier:   {{ rds_result.db_instance_identifier }}"
+          - "Engine:          {{ rds_result.engine }} {{ rds_result.engine_version }}"
+          - "Instance Class:  {{ rds_result.db_instance_class }}"
+          - "Status:          {{ rds_result.db_instance_status }}"
+          - "Endpoint:        {{ rds_result.endpoint.address }}:{{ rds_result.endpoint.port }}"
+          - "Database Name:   {{ db_name }}"
+          - "Master User:     {{ master_username }}"
+          - "Multi-AZ:        {{ rds_result.multi_az }}"
+          - "Storage:         {{ rds_result.allocated_storage }} GB ({{ rds_result.storage_type }})"
+          - "Encrypted:       {{ rds_result.storage_encrypted }}"
+          - "Backup Retain:   {{ rds_result.backup_retention_period }} days"
+          - "Subnet Group:    {{ rds_result.db_subnet_group.db_subnet_group_name }}"
+          - ""
+          - "Connection String ({{ effective_engine }}):"
+          - "  {{ effective_engine }}://{{ master_username }}:<password>@{{ rds_result.endpoint.address }}:{{ rds_result.endpoint.port }}/{{ db_name }}"
+          - "============================================="
+      when: rds_result is defined and rds_result.endpoint is defined
+      tags:
+        - provision
+        - verify

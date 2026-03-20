@@ -1,0 +1,339 @@
+---
+# Playbook: Deploy Laravel PHP Application
+# Description: Installs PHP 8.2 with extensions, Composer, and Nginx. Deploys a
+#              Laravel application with proper permissions, env config, and migrations.
+# Requirements: Ubuntu 22.04 target hosts, MySQL/MariaDB database available
+# Tags: laravel, php, deploy, application
+
+- name: Deploy Laravel PHP Application
+  hosts: all
+  become: true
+
+  vars:
+    app_name: "laravelapp"
+    app_dir: "/var/www/{{ app_name }}"
+    app_user: "www-data"
+    git_repo: ""
+    git_branch: "main"
+    db_host: "localhost"
+    db_name: "{{ app_name }}"
+    db_user: "{{ app_name }}"
+    db_password: ""
+    db_port: 3306
+    app_env: "production"
+    app_key: ""
+    app_debug: "false"
+    app_url: "http://localhost"
+    server_name: "_"
+    php_version: "8.2"
+    composer_version: "2"
+
+  handlers:
+    - name: Restart php-fpm
+      ansible.builtin.systemd:
+        name: "php{{ php_version }}-fpm"
+        state: restarted
+      listen: "restart php-fpm"
+
+    - name: Reload nginx
+      ansible.builtin.systemd:
+        name: nginx
+        state: reloaded
+      listen: "reload nginx"
+
+    - name: Restart nginx
+      ansible.builtin.systemd:
+        name: nginx
+        state: restarted
+      listen: "restart nginx"
+
+  tasks:
+    # ------------------------------------------------------------------
+    # PHP 8.2 and extensions
+    # ------------------------------------------------------------------
+    - name: Install PHP 8.2 with required extensions
+      tags:
+        - setup
+        - php
+      block:
+        - name: Update apt cache
+          ansible.builtin.apt:
+            update_cache: true
+            cache_valid_time: 3600
+
+        - name: Install software-properties-common for PPA support
+          ansible.builtin.apt:
+            name: software-properties-common
+            state: present
+
+        - name: Add Ondrej PHP PPA repository
+          ansible.builtin.apt_repository:
+            repo: "ppa:ondrej/php"
+            state: present
+            update_cache: true
+
+        - name: Install PHP 8.2 and extensions
+          ansible.builtin.apt:
+            name:
+              - "php{{ php_version }}-fpm"
+              - "php{{ php_version }}-cli"
+              - "php{{ php_version }}-mysql"
+              - "php{{ php_version }}-pgsql"
+              - "php{{ php_version }}-mbstring"
+              - "php{{ php_version }}-xml"
+              - "php{{ php_version }}-curl"
+              - "php{{ php_version }}-zip"
+              - "php{{ php_version }}-gd"
+              - "php{{ php_version }}-bcmath"
+              - "php{{ php_version }}-intl"
+              - "php{{ php_version }}-readline"
+              - "php{{ php_version }}-tokenizer"
+              - "php{{ php_version }}-redis"
+            state: present
+          notify: "restart php-fpm"
+
+        - name: Ensure PHP-FPM is enabled and running
+          ansible.builtin.systemd:
+            name: "php{{ php_version }}-fpm"
+            enabled: true
+            state: started
+
+    # ------------------------------------------------------------------
+    # Composer installation
+    # ------------------------------------------------------------------
+    - name: Install Composer
+      tags:
+        - setup
+        - composer
+      block:
+        - name: Download Composer installer
+          ansible.builtin.get_url:
+            url: https://getcomposer.org/installer
+            dest: /tmp/composer-setup.php
+            mode: "0644"
+
+        - name: Install Composer globally
+          ansible.builtin.command:
+            cmd: "php /tmp/composer-setup.php --install-dir=/usr/local/bin --filename=composer"
+            creates: /usr/local/bin/composer
+
+        - name: Verify Composer installation
+          ansible.builtin.command:
+            cmd: composer --version
+          register: composer_version
+          changed_when: false
+
+        - name: Display Composer version
+          ansible.builtin.debug:
+            msg: "{{ composer_version.stdout }}"
+
+    # ------------------------------------------------------------------
+    # Nginx installation
+    # ------------------------------------------------------------------
+    - name: Install Nginx
+      tags:
+        - setup
+        - nginx
+      block:
+        - name: Install Nginx web server
+          ansible.builtin.apt:
+            name:
+              - nginx
+              - git
+              - unzip
+            state: present
+
+    # ------------------------------------------------------------------
+    # Application deployment
+    # ------------------------------------------------------------------
+    - name: Deploy Laravel application
+      tags:
+        - deploy
+      block:
+        - name: Create application directory
+          ansible.builtin.file:
+            path: "{{ app_dir }}"
+            state: directory
+            owner: "{{ app_user }}"
+            group: "{{ app_user }}"
+            mode: "0755"
+
+        - name: Clone or update application repository
+          ansible.builtin.git:
+            repo: "{{ git_repo }}"
+            dest: "{{ app_dir }}"
+            version: "{{ git_branch }}"
+            force: true
+          become_user: "{{ app_user }}"
+          register: git_result
+
+        - name: Install Composer dependencies (production)
+          ansible.builtin.command:
+            cmd: composer install --no-dev --optimize-autoloader --no-interaction
+            chdir: "{{ app_dir }}"
+          become_user: "{{ app_user }}"
+          environment:
+            COMPOSER_HOME: "/tmp/composer-{{ app_user }}"
+          changed_when: true
+
+    # ------------------------------------------------------------------
+    # Laravel configuration
+    # ------------------------------------------------------------------
+    - name: Configure Laravel application
+      tags:
+        - deploy
+        - config
+      block:
+        - name: Deploy .env configuration file
+          ansible.builtin.copy:
+            content: |
+              APP_NAME={{ app_name }}
+              APP_ENV={{ app_env }}
+              APP_KEY={{ app_key }}
+              APP_DEBUG={{ app_debug }}
+              APP_URL={{ app_url }}
+
+              LOG_CHANNEL=stack
+              LOG_LEVEL=error
+
+              DB_CONNECTION=mysql
+              DB_HOST={{ db_host }}
+              DB_PORT={{ db_port }}
+              DB_DATABASE={{ db_name }}
+              DB_USERNAME={{ db_user }}
+              DB_PASSWORD={{ db_password }}
+
+              CACHE_DRIVER=file
+              SESSION_DRIVER=file
+              QUEUE_CONNECTION=sync
+            dest: "{{ app_dir }}/.env"
+            owner: "{{ app_user }}"
+            group: "{{ app_user }}"
+            mode: "0640"
+          no_log: true
+          notify: "restart php-fpm"
+
+        - name: Set permissions on storage directory
+          ansible.builtin.file:
+            path: "{{ app_dir }}/storage"
+            state: directory
+            owner: "{{ app_user }}"
+            group: "{{ app_user }}"
+            mode: "0775"
+            recurse: true
+
+        - name: Set permissions on bootstrap/cache directory
+          ansible.builtin.file:
+            path: "{{ app_dir }}/bootstrap/cache"
+            state: directory
+            owner: "{{ app_user }}"
+            group: "{{ app_user }}"
+            mode: "0775"
+            recurse: true
+
+        - name: Create storage symlink
+          ansible.builtin.command:
+            cmd: php artisan storage:link
+            chdir: "{{ app_dir }}"
+            creates: "{{ app_dir }}/public/storage"
+          become_user: "{{ app_user }}"
+
+        - name: Generate application key (if not provided)
+          ansible.builtin.command:
+            cmd: php artisan key:generate --force
+            chdir: "{{ app_dir }}"
+          become_user: "{{ app_user }}"
+          when: app_key | length == 0
+          changed_when: true
+
+        - name: Run database migrations
+          ansible.builtin.command:
+            cmd: php artisan migrate --force
+            chdir: "{{ app_dir }}"
+          become_user: "{{ app_user }}"
+          changed_when: true
+
+        - name: Cache Laravel configuration
+          ansible.builtin.command:
+            cmd: "php artisan {{ item }}"
+            chdir: "{{ app_dir }}"
+          become_user: "{{ app_user }}"
+          loop:
+            - config:cache
+            - route:cache
+            - view:cache
+          changed_when: true
+
+    # ------------------------------------------------------------------
+    # Nginx configuration
+    # ------------------------------------------------------------------
+    - name: Configure Nginx for Laravel
+      tags:
+        - nginx
+        - config
+      block:
+        - name: Remove default nginx site
+          ansible.builtin.file:
+            path: /etc/nginx/sites-enabled/default
+            state: absent
+          notify: "reload nginx"
+
+        - name: Deploy Nginx configuration for Laravel
+          ansible.builtin.template:
+            src: laravel_nginx.conf.j2
+            dest: "/etc/nginx/sites-available/{{ app_name }}.conf"
+            owner: root
+            group: root
+            mode: "0644"
+          notify: "reload nginx"
+
+        - name: Enable Nginx site configuration
+          ansible.builtin.file:
+            src: "/etc/nginx/sites-available/{{ app_name }}.conf"
+            dest: "/etc/nginx/sites-enabled/{{ app_name }}.conf"
+            state: link
+          notify: "reload nginx"
+
+        - name: Validate Nginx configuration
+          ansible.builtin.command:
+            cmd: nginx -t
+          changed_when: false
+
+        - name: Ensure Nginx is enabled and running
+          ansible.builtin.systemd:
+            name: nginx
+            enabled: true
+            state: started
+
+    # ------------------------------------------------------------------
+    # Verification
+    # ------------------------------------------------------------------
+    - name: Verify Laravel deployment
+      tags:
+        - verify
+      block:
+        - name: Wait for application to become available
+          ansible.builtin.uri:
+            url: "http://localhost/"
+            method: GET
+            status_code:
+              - 200
+              - 301
+              - 302
+          register: health_check
+          retries: 5
+          delay: 2
+          until: health_check is not failed
+
+        - name: Check Laravel application status
+          ansible.builtin.command:
+            cmd: php artisan about --json
+            chdir: "{{ app_dir }}"
+          become_user: "{{ app_user }}"
+          register: laravel_about
+          changed_when: false
+          failed_when: false
+
+        - name: Display deployment result
+          ansible.builtin.debug:
+            msg: "{{ app_name }} (Laravel/PHP {{ php_version }}) deployed successfully"

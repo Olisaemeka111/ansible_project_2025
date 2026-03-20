@@ -1,0 +1,334 @@
+---
+# Playbook: Deploy ASP.NET Core Application
+# Target OS: Ubuntu 22.04
+# Requires: Published ASP.NET Core application files, .NET 8.0 runtime
+# Usage: ansible-playbook aspnet_deployment.yml -e "app_source=/path/to/published app_dll=MyApp.dll"
+
+- name: Deploy ASP.NET Core Application
+  hosts: all
+  become: true
+
+  vars:
+    app_name: "aspnet-app"
+    app_dir: "/opt/{{ app_name }}"
+    app_port: 5000
+    app_dll: "App.dll"
+    app_user: "dotnet"
+    app_group: "dotnet"
+    app_source: "files/{{ app_name }}/published"
+    environment: "Production"
+    server_name: "app.example.com"
+    dotnet_version: "8.0"
+    log_dir: "/var/log/{{ app_name }}"
+    aspnetcore_urls: "http://127.0.0.1:{{ app_port }}"
+    aspnetcore_environment: "{{ environment }}"
+    connection_strings: {}
+    extra_env_vars: {}
+    use_https_redirection: false
+    enable_response_compression: true
+    proxy_read_timeout: "300s"
+    proxy_connect_timeout: "60s"
+    client_max_body_size: "100m"
+
+  handlers:
+    - name: Restart aspnet
+      ansible.builtin.systemd:
+        name: "{{ app_name }}"
+        state: restarted
+        daemon_reload: true
+      tags:
+        - aspnet
+
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+      tags:
+        - aspnet
+
+    - name: Reload nginx
+      ansible.builtin.systemd:
+        name: nginx
+        state: reloaded
+      tags:
+        - nginx
+
+    - name: Restart nginx
+      ansible.builtin.systemd:
+        name: nginx
+        state: restarted
+      tags:
+        - nginx
+
+  tasks:
+    # ------------------------------------------------------------------
+    # .NET Runtime Installation
+    # ------------------------------------------------------------------
+    - name: Install .NET {{ dotnet_version }} runtime
+      tags:
+        - install
+        - dotnet
+      block:
+        - name: Install prerequisite packages
+          ansible.builtin.apt:
+            name:
+              - software-properties-common
+              - apt-transport-https
+              - ca-certificates
+              - curl
+              - wget
+            state: present
+            update_cache: true
+
+        - name: Download Microsoft package repository configuration
+          ansible.builtin.get_url:
+            url: "https://packages.microsoft.com/config/ubuntu/22.04/packages-microsoft-prod.deb"
+            dest: "/tmp/packages-microsoft-prod.deb"
+            mode: "0644"
+
+        - name: Install Microsoft package repository
+          ansible.builtin.apt:
+            deb: "/tmp/packages-microsoft-prod.deb"
+            state: present
+
+        - name: Update apt cache after adding Microsoft repo
+          ansible.builtin.apt:
+            update_cache: true
+
+        - name: Install ASP.NET Core {{ dotnet_version }} runtime
+          ansible.builtin.apt:
+            name:
+              - "aspnetcore-runtime-{{ dotnet_version }}"
+            state: present
+
+        - name: Verify .NET runtime installation
+          ansible.builtin.command:
+            cmd: "dotnet --list-runtimes"
+          changed_when: false
+          register: dotnet_check
+
+        - name: Display .NET runtime versions
+          ansible.builtin.debug:
+            msg: "{{ dotnet_check.stdout_lines }}"
+
+    # ------------------------------------------------------------------
+    # Application User and Directories
+    # ------------------------------------------------------------------
+    - name: Create application user and directories
+      tags:
+        - setup
+      block:
+        - name: Create application group
+          ansible.builtin.group:
+            name: "{{ app_group }}"
+            system: true
+
+        - name: Create application user
+          ansible.builtin.user:
+            name: "{{ app_user }}"
+            group: "{{ app_group }}"
+            home: "/home/{{ app_user }}"
+            shell: "/usr/sbin/nologin"
+            system: true
+            create_home: true
+
+        - name: Create application directory
+          ansible.builtin.file:
+            path: "{{ app_dir }}"
+            state: directory
+            owner: "{{ app_user }}"
+            group: "{{ app_group }}"
+            mode: "0755"
+
+        - name: Create log directory
+          ansible.builtin.file:
+            path: "{{ log_dir }}"
+            state: directory
+            owner: "{{ app_user }}"
+            group: "{{ app_group }}"
+            mode: "0755"
+
+        - name: Create data protection keys directory
+          ansible.builtin.file:
+            path: "{{ app_dir }}/keys"
+            state: directory
+            owner: "{{ app_user }}"
+            group: "{{ app_group }}"
+            mode: "0700"
+
+    # ------------------------------------------------------------------
+    # Application Deployment
+    # ------------------------------------------------------------------
+    - name: Deploy ASP.NET Core application
+      tags:
+        - deploy
+        - aspnet
+      block:
+        - name: Stop application before deployment
+          ansible.builtin.systemd:
+            name: "{{ app_name }}"
+            state: stopped
+          failed_when: false
+
+        - name: Synchronize published application files
+          ansible.builtin.copy:
+            src: "{{ app_source }}/"
+            dest: "{{ app_dir }}/"
+            owner: "{{ app_user }}"
+            group: "{{ app_group }}"
+            mode: "0644"
+            directory_mode: "0755"
+          notify: Restart aspnet
+
+        - name: Ensure application DLL exists
+          ansible.builtin.stat:
+            path: "{{ app_dir }}/{{ app_dll }}"
+          register: dll_check
+
+        - name: Fail if application DLL is missing
+          ansible.builtin.fail:
+            msg: "Application DLL '{{ app_dll }}' not found in {{ app_dir }}"
+          when: not dll_check.stat.exists
+
+        - name: Set ownership on application directory
+          ansible.builtin.file:
+            path: "{{ app_dir }}"
+            owner: "{{ app_user }}"
+            group: "{{ app_group }}"
+            recurse: true
+
+    # ------------------------------------------------------------------
+    # Application Configuration
+    # ------------------------------------------------------------------
+    - name: Deploy ASP.NET Core configuration
+      tags:
+        - config
+        - aspnet
+      block:
+        - name: Deploy appsettings override for environment
+          ansible.builtin.template:
+            src: "templates/aspnet_appsettings.json.j2"
+            dest: "{{ app_dir }}/appsettings.{{ aspnetcore_environment }}.json"
+            owner: "{{ app_user }}"
+            group: "{{ app_group }}"
+            mode: "0640"
+          notify: Restart aspnet
+          when: connection_strings | length > 0
+
+        - name: Deploy environment file
+          ansible.builtin.template:
+            src: "templates/aspnet_env.j2"
+            dest: "/etc/default/{{ app_name }}"
+            owner: root
+            group: "{{ app_group }}"
+            mode: "0640"
+          notify: Restart aspnet
+
+    # ------------------------------------------------------------------
+    # Systemd Service Configuration
+    # ------------------------------------------------------------------
+    - name: Configure systemd service
+      tags:
+        - service
+        - aspnet
+      block:
+        - name: Deploy ASP.NET Core systemd service unit
+          ansible.builtin.template:
+            src: "templates/aspnet.service.j2"
+            dest: "/etc/systemd/system/{{ app_name }}.service"
+            owner: root
+            group: root
+            mode: "0644"
+          notify:
+            - Reload systemd
+            - Restart aspnet
+
+        - name: Ensure ASP.NET Core service is enabled and running
+          ansible.builtin.systemd:
+            name: "{{ app_name }}"
+            state: started
+            enabled: true
+            daemon_reload: true
+
+    # ------------------------------------------------------------------
+    # Nginx Reverse Proxy
+    # ------------------------------------------------------------------
+    - name: Configure Nginx reverse proxy
+      tags:
+        - nginx
+        - config
+      block:
+        - name: Install Nginx
+          ansible.builtin.apt:
+            name: nginx
+            state: present
+
+        - name: Remove default Nginx site
+          ansible.builtin.file:
+            path: "/etc/nginx/sites-enabled/default"
+            state: absent
+          notify: Reload nginx
+
+        - name: Deploy ASP.NET Core Nginx configuration
+          ansible.builtin.template:
+            src: "templates/aspnet_nginx.conf.j2"
+            dest: "/etc/nginx/sites-available/{{ app_name }}.conf"
+            owner: root
+            group: root
+            mode: "0644"
+          notify: Reload nginx
+
+        - name: Enable ASP.NET Core Nginx virtual host
+          ansible.builtin.file:
+            src: "/etc/nginx/sites-available/{{ app_name }}.conf"
+            dest: "/etc/nginx/sites-enabled/{{ app_name }}.conf"
+            state: link
+          notify: Reload nginx
+
+        - name: Validate Nginx configuration
+          ansible.builtin.command:
+            cmd: "nginx -t"
+          changed_when: false
+
+        - name: Ensure Nginx is enabled and running
+          ansible.builtin.systemd:
+            name: nginx
+            state: started
+            enabled: true
+
+    # ------------------------------------------------------------------
+    # Health Check
+    # ------------------------------------------------------------------
+    - name: Verify ASP.NET Core application health
+      tags:
+        - verify
+      block:
+        - name: Wait for application to start listening
+          ansible.builtin.wait_for:
+            port: "{{ app_port }}"
+            host: "127.0.0.1"
+            delay: 5
+            timeout: 60
+
+        - name: Check application health endpoint
+          ansible.builtin.uri:
+            url: "http://127.0.0.1:{{ app_port }}"
+            status_code:
+              - 200
+              - 301
+              - 302
+              - 404
+            timeout: 10
+          register: health_check
+          retries: 5
+          delay: 5
+          until: health_check is succeeded
+
+        - name: Display service status
+          ansible.builtin.command:
+            cmd: "systemctl status {{ app_name }} --no-pager"
+          changed_when: false
+          register: service_status
+
+        - name: Display deployment success
+          ansible.builtin.debug:
+            msg: "ASP.NET Core application '{{ app_name }}' ({{ app_dll }}) deployed successfully in {{ aspnetcore_environment }} mode on port {{ app_port }}"

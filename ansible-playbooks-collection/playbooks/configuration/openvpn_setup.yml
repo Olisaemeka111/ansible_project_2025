@@ -1,0 +1,278 @@
+---
+# Ansible Playbook: OpenVPN Server Setup
+# Installs and configures OpenVPN server with Easy-RSA PKI on Ubuntu 22.04.
+# Usage: ansible-playbook openvpn_setup.yml --limit vpn_servers
+
+- name: Install and configure OpenVPN server
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    vpn_network: "10.8.0.0"
+    vpn_netmask: "255.255.255.0"
+    vpn_port: 1194
+    vpn_protocol: "udp"
+    vpn_dns_servers:
+      - "1.1.1.1"
+      - "1.0.0.1"
+    vpn_cipher: "AES-256-GCM"
+    vpn_auth: "SHA256"
+    easyrsa_dir: "/etc/openvpn/easy-rsa"
+    openvpn_server_name: "server"
+    vpn_ca_expire: 3650
+    vpn_cert_expire: 3650
+    vpn_dh_size: 2048
+    vpn_interface: "{{ ansible_default_ipv4.interface | default('eth0') }}"
+
+  handlers:
+    - name: Restart openvpn service
+      ansible.builtin.systemd:
+        name: "openvpn-server@{{ openvpn_server_name }}"
+        state: restarted
+        daemon_reload: true
+
+    - name: Reload ufw
+      ansible.builtin.command:
+        cmd: ufw reload
+      changed_when: true
+
+  tasks:
+    - name: Install OpenVPN and dependencies
+      tags: [install]
+      block:
+        - name: Update apt cache
+          ansible.builtin.apt:
+            update_cache: true
+            cache_valid_time: 3600
+
+        - name: Install OpenVPN and Easy-RSA packages
+          ansible.builtin.apt:
+            name:
+              - openvpn
+              - easy-rsa
+              - iptables-persistent
+            state: present
+
+    - name: Initialize PKI infrastructure
+      tags: [pki]
+      block:
+        - name: Create Easy-RSA directory
+          ansible.builtin.file:
+            path: "{{ easyrsa_dir }}"
+            state: directory
+            mode: "0700"
+
+        - name: Symlink Easy-RSA scripts
+          ansible.builtin.command:
+            cmd: "cp -r /usr/share/easy-rsa/* {{ easyrsa_dir }}/"
+            creates: "{{ easyrsa_dir }}/easyrsa"
+
+        - name: Deploy Easy-RSA vars file
+          ansible.builtin.copy:
+            content: |
+              set_var EASYRSA_ALGO         "ec"
+              set_var EASYRSA_DIGEST       "sha512"
+              set_var EASYRSA_KEY_SIZE     {{ vpn_dh_size }}
+              set_var EASYRSA_CA_EXPIRE    {{ vpn_ca_expire }}
+              set_var EASYRSA_CERT_EXPIRE  {{ vpn_cert_expire }}
+              set_var EASYRSA_REQ_CN       "OpenVPN-CA"
+              set_var EASYRSA_BATCH        "yes"
+            dest: "{{ easyrsa_dir }}/vars"
+            mode: "0600"
+
+        - name: Initialize PKI
+          ansible.builtin.command:
+            cmd: "./easyrsa init-pki"
+            chdir: "{{ easyrsa_dir }}"
+            creates: "{{ easyrsa_dir }}/pki"
+
+        - name: Build Certificate Authority (non-interactive)
+          ansible.builtin.command:
+            cmd: "./easyrsa --batch build-ca nopass"
+            chdir: "{{ easyrsa_dir }}"
+            creates: "{{ easyrsa_dir }}/pki/ca.crt"
+          environment:
+            EASYRSA_BATCH: "1"
+
+        - name: Generate server certificate and key
+          ansible.builtin.command:
+            cmd: "./easyrsa --batch build-server-full {{ openvpn_server_name }} nopass"
+            chdir: "{{ easyrsa_dir }}"
+            creates: "{{ easyrsa_dir }}/pki/issued/{{ openvpn_server_name }}.crt"
+          environment:
+            EASYRSA_BATCH: "1"
+
+        - name: Generate Diffie-Hellman parameters
+          ansible.builtin.command:
+            cmd: "./easyrsa gen-dh"
+            chdir: "{{ easyrsa_dir }}"
+            creates: "{{ easyrsa_dir }}/pki/dh.pem"
+
+        - name: Generate TLS auth key
+          ansible.builtin.command:
+            cmd: "openvpn --genkey secret /etc/openvpn/server/ta.key"
+            creates: /etc/openvpn/server/ta.key
+
+    - name: Copy PKI files to OpenVPN directory
+      tags: [pki]
+      block:
+        - name: Create OpenVPN server directory
+          ansible.builtin.file:
+            path: /etc/openvpn/server
+            state: directory
+            mode: "0700"
+
+        - name: Copy CA certificate
+          ansible.builtin.copy:
+            src: "{{ easyrsa_dir }}/pki/ca.crt"
+            dest: /etc/openvpn/server/ca.crt
+            remote_src: true
+            mode: "0644"
+
+        - name: Copy server certificate
+          ansible.builtin.copy:
+            src: "{{ easyrsa_dir }}/pki/issued/{{ openvpn_server_name }}.crt"
+            dest: /etc/openvpn/server/{{ openvpn_server_name }}.crt
+            remote_src: true
+            mode: "0644"
+
+        - name: Copy server key
+          ansible.builtin.copy:
+            src: "{{ easyrsa_dir }}/pki/private/{{ openvpn_server_name }}.key"
+            dest: /etc/openvpn/server/{{ openvpn_server_name }}.key
+            remote_src: true
+            mode: "0600"
+
+        - name: Copy DH parameters
+          ansible.builtin.copy:
+            src: "{{ easyrsa_dir }}/pki/dh.pem"
+            dest: /etc/openvpn/server/dh.pem
+            remote_src: true
+            mode: "0644"
+
+    - name: Configure OpenVPN server
+      tags: [configure]
+      block:
+        - name: Deploy OpenVPN server configuration
+          ansible.builtin.copy:
+            content: |
+              # OpenVPN Server Configuration
+              # Managed by Ansible - do not edit manually
+
+              port {{ vpn_port }}
+              proto {{ vpn_protocol }}
+              dev tun
+
+              ca /etc/openvpn/server/ca.crt
+              cert /etc/openvpn/server/{{ openvpn_server_name }}.crt
+              key /etc/openvpn/server/{{ openvpn_server_name }}.key
+              dh /etc/openvpn/server/dh.pem
+              tls-auth /etc/openvpn/server/ta.key 0
+
+              server {{ vpn_network }} {{ vpn_netmask }}
+              ifconfig-pool-persist /var/log/openvpn/ipp.txt
+
+              push "redirect-gateway def1 bypass-dhcp"
+              {% for dns in vpn_dns_servers %}
+              push "dhcp-option DNS {{ dns }}"
+              {% endfor %}
+
+              keepalive 10 120
+              cipher {{ vpn_cipher }}
+              auth {{ vpn_auth }}
+
+              user nobody
+              group nogroup
+              persist-key
+              persist-tun
+
+              status /var/log/openvpn/openvpn-status.log
+              log-append /var/log/openvpn/openvpn.log
+              verb 3
+              mute 20
+
+              explicit-exit-notify {{ '1' if vpn_protocol == 'udp' else '0' }}
+            dest: "/etc/openvpn/server/{{ openvpn_server_name }}.conf"
+            owner: root
+            group: root
+            mode: "0600"
+          notify: Restart openvpn service
+
+        - name: Create OpenVPN log directory
+          ansible.builtin.file:
+            path: /var/log/openvpn
+            state: directory
+            owner: nobody
+            group: nogroup
+            mode: "0750"
+
+    - name: Configure IP forwarding
+      tags: [network]
+      block:
+        - name: Enable IPv4 forwarding via sysctl
+          ansible.posix.sysctl:
+            name: net.ipv4.ip_forward
+            value: "1"
+            sysctl_set: true
+            state: present
+            reload: true
+
+    - name: Configure UFW for VPN
+      tags: [firewall]
+      block:
+        - name: Allow OpenVPN port through UFW
+          community.general.ufw:
+            rule: allow
+            port: "{{ vpn_port | string }}"
+            proto: "{{ vpn_protocol }}"
+            comment: "OpenVPN server"
+
+        - name: Configure UFW before rules for NAT masquerading
+          ansible.builtin.blockinfile:
+            path: /etc/ufw/before.rules
+            insertbefore: "^\\*filter"
+            block: |
+              # NAT table rules for OpenVPN
+              *nat
+              :POSTROUTING ACCEPT [0:0]
+              -A POSTROUTING -s {{ vpn_network }}/24 -o {{ vpn_interface }} -j MASQUERADE
+              COMMIT
+            marker: "# {mark} ANSIBLE MANAGED BLOCK - OPENVPN NAT"
+          notify: Reload ufw
+
+        - name: Ensure UFW allows forwarded packets
+          ansible.builtin.lineinfile:
+            path: /etc/default/ufw
+            regexp: '^DEFAULT_FORWARD_POLICY='
+            line: 'DEFAULT_FORWARD_POLICY="ACCEPT"'
+          notify: Reload ufw
+
+    - name: Start and enable OpenVPN service
+      tags: [service]
+      ansible.builtin.systemd:
+        name: "openvpn-server@{{ openvpn_server_name }}"
+        state: started
+        enabled: true
+        daemon_reload: true
+
+    - name: Verify OpenVPN is running
+      tags: [verify]
+      block:
+        - name: Check OpenVPN service status
+          ansible.builtin.systemd:
+            name: "openvpn-server@{{ openvpn_server_name }}"
+          register: openvpn_service
+
+        - name: Display OpenVPN service status
+          ansible.builtin.debug:
+            msg: "OpenVPN service is {{ openvpn_service.status.ActiveState }}"
+
+        - name: Verify VPN tunnel interface exists
+          ansible.builtin.command:
+            cmd: ip addr show tun0
+          changed_when: false
+          register: tun_interface
+          retries: 5
+          delay: 3
+          until: tun_interface.rc == 0

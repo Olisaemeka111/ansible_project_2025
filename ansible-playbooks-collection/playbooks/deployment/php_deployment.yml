@@ -1,0 +1,276 @@
+---
+# Playbook: Deploy Generic PHP Application with PHP-FPM and Nginx
+# Target OS: Ubuntu 22.04
+# Requires: Git repository with PHP application, Composer dependencies
+# Usage: ansible-playbook php_deployment.yml -e "git_repo=https://github.com/org/app.git server_name=app.example.com"
+
+- name: Deploy PHP Application with PHP-FPM and Nginx
+  hosts: all
+  become: true
+
+  vars:
+    app_name: "php-app"
+    app_dir: "/var/www/{{ app_name }}"
+    git_repo: "https://github.com/example/php-app.git"
+    git_branch: "main"
+    php_version: "8.2"
+    server_name: "app.example.com"
+    app_user: "www-data"
+    app_group: "www-data"
+    php_fpm_pool_name: "{{ app_name }}"
+    php_fpm_listen: "/run/php/php{{ php_version }}-fpm-{{ app_name }}.sock"
+    php_memory_limit: "256M"
+    php_max_execution_time: "60"
+    php_upload_max_filesize: "64M"
+    php_post_max_size: "64M"
+    php_extensions:
+      - "php{{ php_version }}-fpm"
+      - "php{{ php_version }}-mysql"
+      - "php{{ php_version }}-pgsql"
+      - "php{{ php_version }}-mbstring"
+      - "php{{ php_version }}-xml"
+      - "php{{ php_version }}-curl"
+      - "php{{ php_version }}-gd"
+      - "php{{ php_version }}-zip"
+      - "php{{ php_version }}-intl"
+      - "php{{ php_version }}-opcache"
+      - "php{{ php_version }}-readline"
+    composer_version: "2.7"
+    env_file_content: ""
+
+  handlers:
+    - name: Restart php-fpm
+      ansible.builtin.systemd:
+        name: "php{{ php_version }}-fpm"
+        state: restarted
+        daemon_reload: true
+      tags:
+        - php
+
+    - name: Reload nginx
+      ansible.builtin.systemd:
+        name: nginx
+        state: reloaded
+      tags:
+        - nginx
+
+    - name: Restart nginx
+      ansible.builtin.systemd:
+        name: nginx
+        state: restarted
+      tags:
+        - nginx
+
+  tasks:
+    # ------------------------------------------------------------------
+    # PHP Installation
+    # ------------------------------------------------------------------
+    - name: Install PHP and required extensions
+      tags:
+        - php
+        - install
+      block:
+        - name: Install prerequisite packages
+          ansible.builtin.apt:
+            name:
+              - software-properties-common
+              - apt-transport-https
+              - ca-certificates
+              - gnupg
+              - git
+              - unzip
+              - acl
+            state: present
+            update_cache: true
+
+        - name: Add Ondrej PHP PPA repository
+          ansible.builtin.apt_repository:
+            repo: "ppa:ondrej/php"
+            state: present
+            update_cache: true
+
+        - name: Install PHP {{ php_version }} and extensions
+          ansible.builtin.apt:
+            name: "{{ ['php' + php_version] + php_extensions }}"
+            state: present
+            update_cache: true
+
+    # ------------------------------------------------------------------
+    # Composer Installation
+    # ------------------------------------------------------------------
+    - name: Install Composer globally
+      tags:
+        - php
+        - composer
+      block:
+        - name: Download Composer installer
+          ansible.builtin.get_url:
+            url: "https://getcomposer.org/installer"
+            dest: "/tmp/composer-setup.php"
+            mode: "0755"
+
+        - name: Install Composer globally
+          ansible.builtin.command:
+            cmd: "php /tmp/composer-setup.php --install-dir=/usr/local/bin --filename=composer --{{ composer_version | regex_search('^[0-9]+') }}"
+            creates: "/usr/local/bin/composer"
+
+        - name: Verify Composer installation
+          ansible.builtin.command:
+            cmd: "composer --version"
+          changed_when: false
+          register: composer_check
+
+        - name: Display Composer version
+          ansible.builtin.debug:
+            msg: "{{ composer_check.stdout }}"
+
+    # ------------------------------------------------------------------
+    # Application Deployment
+    # ------------------------------------------------------------------
+    - name: Deploy PHP application
+      tags:
+        - deploy
+      block:
+        - name: Create application directory
+          ansible.builtin.file:
+            path: "{{ app_dir }}"
+            state: directory
+            owner: "{{ app_user }}"
+            group: "{{ app_group }}"
+            mode: "0755"
+
+        - name: Clone application repository
+          ansible.builtin.git:
+            repo: "{{ git_repo }}"
+            dest: "{{ app_dir }}"
+            version: "{{ git_branch }}"
+            force: true
+          become_user: "{{ app_user }}"
+
+        - name: Deploy .env file
+          ansible.builtin.copy:
+            content: "{{ env_file_content }}"
+            dest: "{{ app_dir }}/.env"
+            owner: "{{ app_user }}"
+            group: "{{ app_group }}"
+            mode: "0640"
+          when: env_file_content | length > 0
+
+        - name: Install Composer dependencies
+          ansible.builtin.command:
+            cmd: "composer install --no-dev --optimize-autoloader --no-interaction"
+            chdir: "{{ app_dir }}"
+          become_user: "{{ app_user }}"
+          environment:
+            COMPOSER_HOME: "/tmp/composer"
+          register: composer_install
+          changed_when: "'Nothing to install' not in composer_install.stdout"
+
+        - name: Set storage directory permissions
+          ansible.builtin.file:
+            path: "{{ app_dir }}/{{ item }}"
+            state: directory
+            owner: "{{ app_user }}"
+            group: "{{ app_group }}"
+            mode: "0775"
+            recurse: true
+          loop:
+            - storage
+            - bootstrap/cache
+          failed_when: false
+
+    # ------------------------------------------------------------------
+    # PHP-FPM Configuration
+    # ------------------------------------------------------------------
+    - name: Configure PHP-FPM pool
+      tags:
+        - php
+        - config
+      block:
+        - name: Deploy PHP-FPM pool configuration
+          ansible.builtin.template:
+            src: "templates/php_app.conf.j2"
+            dest: "/etc/php/{{ php_version }}/fpm/pool.d/{{ php_fpm_pool_name }}.conf"
+            owner: root
+            group: root
+            mode: "0644"
+            validate: "php-fpm{{ php_version }} -t -y %s"
+          notify: Restart php-fpm
+
+        - name: Ensure PHP-FPM service is enabled and running
+          ansible.builtin.systemd:
+            name: "php{{ php_version }}-fpm"
+            state: started
+            enabled: true
+
+    # ------------------------------------------------------------------
+    # Nginx Configuration
+    # ------------------------------------------------------------------
+    - name: Configure Nginx
+      tags:
+        - nginx
+        - config
+      block:
+        - name: Install Nginx
+          ansible.builtin.apt:
+            name: nginx
+            state: present
+
+        - name: Remove default Nginx site
+          ansible.builtin.file:
+            path: "/etc/nginx/sites-enabled/default"
+            state: absent
+          notify: Reload nginx
+
+        - name: Deploy Nginx virtual host configuration
+          ansible.builtin.template:
+            src: "templates/php_nginx.conf.j2"
+            dest: "/etc/nginx/sites-available/{{ app_name }}.conf"
+            owner: root
+            group: root
+            mode: "0644"
+          notify: Reload nginx
+
+        - name: Enable Nginx virtual host
+          ansible.builtin.file:
+            src: "/etc/nginx/sites-available/{{ app_name }}.conf"
+            dest: "/etc/nginx/sites-enabled/{{ app_name }}.conf"
+            state: link
+          notify: Reload nginx
+
+        - name: Validate Nginx configuration
+          ansible.builtin.command:
+            cmd: "nginx -t"
+          changed_when: false
+
+        - name: Ensure Nginx service is enabled and running
+          ansible.builtin.systemd:
+            name: nginx
+            state: started
+            enabled: true
+
+    # ------------------------------------------------------------------
+    # Health Check
+    # ------------------------------------------------------------------
+    - name: Verify application health
+      tags:
+        - verify
+      block:
+        - name: Wait for PHP-FPM socket
+          ansible.builtin.wait_for:
+            path: "{{ php_fpm_listen }}"
+            state: present
+            timeout: 30
+
+        - name: Wait for Nginx to respond
+          ansible.builtin.uri:
+            url: "http://localhost"
+            status_code:
+              - 200
+              - 301
+              - 302
+            timeout: 10
+          register: health_check
+          retries: 5
+          delay: 3
+          until: health_check is succeeded

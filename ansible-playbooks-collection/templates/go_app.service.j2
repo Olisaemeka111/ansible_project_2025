@@ -1,0 +1,35 @@
+[Unit]
+Description={{ app_name }} Go Application
+After=network.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User={{ app_user }}
+Group={{ app_user }}
+WorkingDirectory={{ app_dir }}
+ExecStart={{ app_dir }}/{{ app_name }}
+Restart=always
+RestartSec=5
+
+# Environment variables
+{% if app_env is defined %}
+{% for key, value in app_env.items() %}
+Environment="{{ key }}={{ value }}"
+{% endfor %}
+{% endif %}
+Environment="PORT={{ app_port | default(8080) }}"
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier={{ app_name }}
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

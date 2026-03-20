@@ -1,0 +1,221 @@
+---
+# Ansible Playbook: Redis Server Configuration
+# Installs and configures Redis with security and performance tuning.
+# Usage: ansible-playbook redis_configuration.yml --limit cache_servers
+
+- name: Install and configure Redis server
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    redis_bind: "127.0.0.1 ::1"
+    redis_port: 6379
+    redis_maxmemory: "256mb"
+    redis_maxmemory_policy: "allkeys-lru"
+    redis_password: ""
+    redis_databases: 16
+    redis_save_intervals:
+      - "3600 1"
+      - "300 100"
+      - "60 10000"
+    redis_tcp_backlog: 511
+    redis_timeout: 0
+    redis_tcp_keepalive: 300
+    redis_loglevel: "notice"
+    redis_appendonly: "yes"
+    redis_appendfsync: "everysec"
+
+  handlers:
+    - name: Restart redis service
+      ansible.builtin.systemd:
+        name: redis-server
+        state: restarted
+
+    - name: Reload redis service
+      ansible.builtin.systemd:
+        name: redis-server
+        state: reloaded
+
+  tasks:
+    - name: Install Redis
+      tags: [install]
+      block:
+        - name: Update apt cache
+          ansible.builtin.apt:
+            update_cache: true
+            cache_valid_time: 3600
+
+        - name: Install redis-server package
+          ansible.builtin.apt:
+            name:
+              - redis-server
+              - redis-tools
+            state: present
+
+    - name: Configure Redis
+      tags: [configure]
+      block:
+        - name: Backup original Redis configuration
+          ansible.builtin.copy:
+            src: /etc/redis/redis.conf
+            dest: /etc/redis/redis.conf.bak
+            remote_src: true
+            force: false
+            mode: "0640"
+
+        - name: Deploy Redis configuration
+          ansible.builtin.copy:
+            content: |
+              # Redis Configuration
+              # Managed by Ansible - do not edit manually
+
+              # Network
+              bind {{ redis_bind }}
+              port {{ redis_port }}
+              tcp-backlog {{ redis_tcp_backlog }}
+              timeout {{ redis_timeout }}
+              tcp-keepalive {{ redis_tcp_keepalive }}
+
+              # General
+              daemonize no
+              supervised systemd
+              pidfile /run/redis/redis-server.pid
+              loglevel {{ redis_loglevel }}
+              logfile /var/log/redis/redis-server.log
+              databases {{ redis_databases }}
+
+              # Snapshotting
+              {% for interval in redis_save_intervals %}
+              save {{ interval }}
+              {% endfor %}
+              stop-writes-on-bgsave-error yes
+              rdbcompression yes
+              rdbchecksum yes
+              dbfilename dump.rdb
+              dir /var/lib/redis
+
+              # Security
+              {% if redis_password | length > 0 %}
+              requirepass {{ redis_password }}
+              {% endif %}
+              protected-mode yes
+              rename-command FLUSHDB ""
+              rename-command FLUSHALL ""
+              rename-command DEBUG ""
+
+              # Memory Management
+              maxmemory {{ redis_maxmemory }}
+              maxmemory-policy {{ redis_maxmemory_policy }}
+
+              # Append Only File
+              appendonly {{ redis_appendonly }}
+              appendfilename "appendonly.aof"
+              appendfsync {{ redis_appendfsync }}
+              no-appendfsync-on-rewrite no
+              auto-aof-rewrite-percentage 100
+              auto-aof-rewrite-min-size 64mb
+
+              # Slow Log
+              slowlog-log-slower-than 10000
+              slowlog-max-len 128
+
+              # Latency Monitor
+              latency-monitor-threshold 0
+            dest: /etc/redis/redis.conf
+            owner: redis
+            group: redis
+            mode: "0640"
+          notify: Restart redis service
+
+    - name: Configure systemd overrides for Redis
+      tags: [configure]
+      block:
+        - name: Create systemd override directory for Redis
+          ansible.builtin.file:
+            path: /etc/systemd/system/redis-server.service.d
+            state: directory
+            mode: "0755"
+
+        - name: Deploy systemd override for Redis
+          ansible.builtin.copy:
+            content: |
+              [Service]
+              # Increase file descriptor limit
+              LimitNOFILE=65535
+
+              # Enable memory overcommit for background saves
+              ExecStartPre=/bin/sh -c 'echo 1 > /proc/sys/vm/overcommit_memory || true'
+
+              # Disable Transparent Huge Pages
+              ExecStartPre=/bin/sh -c 'echo never > /sys/kernel/mm/transparent_hugepage/enabled || true'
+
+              [Unit]
+              After=network-online.target
+              Wants=network-online.target
+            dest: /etc/systemd/system/redis-server.service.d/override.conf
+            mode: "0644"
+          notify: Restart redis service
+
+    - name: Configure kernel parameters for Redis
+      tags: [configure]
+      block:
+        - name: Set vm.overcommit_memory for Redis
+          ansible.posix.sysctl:
+            name: vm.overcommit_memory
+            value: "1"
+            sysctl_set: true
+            state: present
+            reload: true
+
+        - name: Set net.core.somaxconn for Redis
+          ansible.posix.sysctl:
+            name: net.core.somaxconn
+            value: "65535"
+            sysctl_set: true
+            state: present
+            reload: true
+
+    - name: Start and enable Redis service
+      tags: [service]
+      ansible.builtin.systemd:
+        name: redis-server
+        state: started
+        enabled: true
+        daemon_reload: true
+
+    - name: Verify Redis installation
+      tags: [verify]
+      block:
+        - name: Test Redis ping (without password)
+          ansible.builtin.command:
+            cmd: redis-cli -p {{ redis_port }} ping
+          changed_when: false
+          register: redis_ping
+          when: redis_password | length == 0
+
+        - name: Test Redis ping (with password)
+          ansible.builtin.command:
+            cmd: "redis-cli -p {{ redis_port }} -a {{ redis_password }} --no-auth-warning ping"
+          changed_when: false
+          register: redis_ping_auth
+          when: redis_password | length > 0
+          no_log: true
+
+        - name: Display Redis ping result
+          ansible.builtin.debug:
+            msg: "Redis PING response: {{ (redis_ping.stdout | default(redis_ping_auth.stdout | default('UNKNOWN'))) }}"
+
+        - name: Get Redis server info
+          ansible.builtin.command:
+            cmd: >-
+              redis-cli -p {{ redis_port }}
+              {% if redis_password | length > 0 %}-a {{ redis_password }} --no-auth-warning{% endif %}
+              info server
+          changed_when: false
+          register: redis_info
+          no_log: true
+
+        - name: Display Redis version
+          ansible.builtin.debug:
+            msg: "Redis version: {{ redis_info.stdout | regex_search('redis_version:(.+)', '\\1') | first }}"

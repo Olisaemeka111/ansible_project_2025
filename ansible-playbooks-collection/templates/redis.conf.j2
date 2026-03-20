@@ -1,0 +1,156 @@
+# Ansible managed - Redis server configuration
+# Template: redis.conf.j2
+#
+# Variables:
+#   redis_bind          - Bind address (default: 127.0.0.1)
+#   redis_port          - Listen port (default: 6379)
+#   redis_password      - Require password authentication (optional)
+#   redis_maxmemory     - Maximum memory limit (default: 256mb)
+#   redis_maxmemory_policy - Eviction policy when maxmemory is reached (default: allkeys-lru)
+#   redis_appendonly    - Enable AOF persistence (default: yes)
+#   redis_databases     - Number of databases (default: 16)
+#   redis_timeout       - Client idle timeout in seconds (default: 300)
+#   redis_loglevel      - Log verbosity: debug, verbose, notice, warning (default: notice)
+
+################################## NETWORK #####################################
+
+# Bind to specific interface(s) - use 0.0.0.0 for all interfaces (NOT recommended in production)
+bind {{ redis_bind | default('127.0.0.1') }}
+
+# Listening port - set to 0 to disable TCP and use Unix socket only
+port {{ redis_port | default(6379) }}
+
+# TCP listen backlog
+tcp-backlog {{ redis_tcp_backlog | default(511) }}
+
+# Close connection after client is idle for N seconds (0 = disable)
+timeout {{ redis_timeout | default(300) }}
+
+# TCP keepalive - recommended 300 seconds for detecting dead peers
+tcp-keepalive {{ redis_tcp_keepalive | default(300) }}
+
+################################## GENERAL #####################################
+
+# Run as a daemon - set to 'no' when managed by systemd
+daemonize no
+
+# Supervised by systemd
+supervised systemd
+
+# PID file
+pidfile /var/run/redis/redis-server.pid
+
+# Log level: debug, verbose, notice, warning
+loglevel {{ redis_loglevel | default('notice') }}
+
+# Log file path - empty string logs to stdout (useful with systemd)
+logfile {{ redis_logfile | default('/var/log/redis/redis-server.log') }}
+
+# Number of databases (default DB is 0)
+databases {{ redis_databases | default(16) }}
+
+################################## SECURITY ####################################
+
+{% if redis_password is defined and redis_password %}
+# Require clients to authenticate with a password
+requirepass {{ redis_password }}
+{% endif %}
+
+{% if redis_rename_commands | default(false) %}
+# Rename dangerous commands to prevent accidental use
+rename-command FLUSHDB ""
+rename-command FLUSHALL ""
+rename-command DEBUG ""
+rename-command CONFIG "CONFIG_{{ redis_config_suffix | default('SECURED') }}"
+{% endif %}
+
+# Disable protected mode if binding to non-localhost and password is set
+{% if redis_bind | default('127.0.0.1') != '127.0.0.1' and redis_password is defined %}
+protected-mode no
+{% else %}
+protected-mode yes
+{% endif %}
+
+################################# MEMORY #######################################
+
+# Maximum memory limit - Redis will use eviction policy when limit is reached
+maxmemory {{ redis_maxmemory | default('256mb') }}
+
+# Eviction policy when maxmemory is reached:
+#   noeviction     - return error on write operations
+#   allkeys-lru    - evict least recently used keys (recommended for cache)
+#   allkeys-lfu    - evict least frequently used keys
+#   volatile-lru   - evict LRU keys with TTL set
+#   volatile-lfu   - evict LFU keys with TTL set
+#   volatile-ttl   - evict keys with shortest TTL
+#   allkeys-random - evict random keys
+#   volatile-random - evict random keys with TTL set
+maxmemory-policy {{ redis_maxmemory_policy | default('allkeys-lru') }}
+
+# LRU/LFU sampling size - higher = more accurate but slower (default: 5)
+maxmemory-samples {{ redis_maxmemory_samples | default(5) }}
+
+################################ SNAPSHOTTING ###################################
+
+# RDB persistence - save <seconds> <changes>
+# Save the DB if at least N changes in M seconds
+{% for save_rule in redis_save_rules | default(['900 1', '300 10', '60 10000']) %}
+save {{ save_rule }}
+{% endfor %}
+
+# Stop accepting writes if RDB save fails - data safety mechanism
+stop-writes-on-bgsave-error {{ redis_stop_writes_on_bgsave_error | default('yes') }}
+
+# Compress RDB files using LZF compression
+rdbcompression {{ redis_rdb_compression | default('yes') }}
+
+# RDB checksum for data integrity
+rdbchecksum {{ redis_rdb_checksum | default('yes') }}
+
+# RDB filename
+dbfilename {{ redis_dbfilename | default('dump.rdb') }}
+
+# Working directory for RDB and AOF files
+dir {{ redis_dir | default('/var/lib/redis') }}
+
+############################## APPEND ONLY MODE #################################
+
+# AOF (Append Only File) persistence - more durable than RDB snapshots
+appendonly {{ redis_appendonly | default('yes') }}
+
+# AOF filename
+appendfilename "{{ redis_appendfilename | default('appendonly.aof') }}"
+
+# AOF fsync policy:
+#   always    - fsync every write (slowest, safest)
+#   everysec  - fsync once per second (good compromise)
+#   no        - let OS handle fsync (fastest, least safe)
+appendfsync {{ redis_appendfsync | default('everysec') }}
+
+# Disable fsync during rewrite to avoid disk I/O spikes
+no-appendfsync-on-rewrite {{ redis_no_appendfsync_on_rewrite | default('no') }}
+
+# AOF rewrite triggers
+auto-aof-rewrite-percentage {{ redis_aof_rewrite_percentage | default(100) }}
+auto-aof-rewrite-min-size {{ redis_aof_rewrite_min_size | default('64mb') }}
+
+############################# SLOW LOG #########################################
+
+# Log queries slower than N microseconds (10000 = 10ms)
+slowlog-log-slower-than {{ redis_slowlog_threshold | default(10000) }}
+
+# Maximum number of slow log entries
+slowlog-max-len {{ redis_slowlog_max_len | default(128) }}
+
+########################## CLIENT CONNECTIONS ##################################
+
+# Maximum number of simultaneous client connections
+maxclients {{ redis_maxclients | default(10000) }}
+
+{% if redis_cluster_enabled | default(false) %}
+################################ REDIS CLUSTER #################################
+
+cluster-enabled yes
+cluster-config-file nodes-{{ redis_port | default(6379) }}.conf
+cluster-node-timeout {{ redis_cluster_node_timeout | default(15000) }}
+{% endif %}

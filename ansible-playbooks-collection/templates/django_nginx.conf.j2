@@ -1,0 +1,145 @@
+# Ansible managed - Nginx configuration for Django application
+# Template: django_nginx.conf.j2
+#
+# Variables:
+#   app_name         - Application name (default: django-app)
+#   server_name      - Server hostname (default: '_')
+#   app_port         - Gunicorn backend port (default: 8000)
+#   static_root      - Django STATIC_ROOT directory (default: /opt/{{ app_name }}/static)
+#   media_root       - Django MEDIA_ROOT directory (default: /opt/{{ app_name }}/media)
+#   static_url       - Django STATIC_URL (default: /static/)
+#   media_url        - Django MEDIA_URL (default: /media/)
+#   client_max_body_size - Max upload size (default: 10m)
+#   enable_ssl       - Enable HTTPS (default: false)
+#   ssl_cert         - Path to SSL certificate
+#   ssl_key          - Path to SSL private key
+
+# Upstream definition for Gunicorn backend
+upstream {{ app_name | default('django-app') }}_server {
+    server {{ gunicorn_bind_address | default('127.0.0.1') }}:{{ app_port | default(8000) }} fail_timeout=0;
+}
+
+server {
+    listen {{ listen_port | default(80) }};
+    server_name {{ server_name | default('_') }};
+
+    # Max upload size - must match Django's FILE_UPLOAD_MAX_MEMORY_SIZE
+    client_max_body_size {{ client_max_body_size | default('10m') }};
+
+    # Security headers
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-XSS-Protection "1; mode=block" always;
+{% if enable_ssl | default(false) %}
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+{% endif %}
+
+    # Django static files - served directly by Nginx for performance
+    # Run 'python manage.py collectstatic' to populate this directory
+    location {{ static_url | default('/static/') }} {
+        alias {{ static_root | default('/opt/' + app_name | default('django-app') + '/static') }}/;
+        expires 30d;
+        add_header Cache-Control "public, immutable";
+        access_log off;
+    }
+
+    # Django media files - user-uploaded content
+    location {{ media_url | default('/media/') }} {
+        alias {{ media_root | default('/opt/' + app_name | default('django-app') + '/media') }}/;
+        expires 7d;
+        add_header Cache-Control "public";
+        access_log off;
+    }
+
+    # Favicon - prevent 404 log noise
+    location = /favicon.ico {
+        access_log off;
+        log_not_found off;
+    }
+
+    # Proxy all other requests to Gunicorn
+    location / {
+        proxy_pass http://{{ app_name | default('django-app') }}_server;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_redirect off;
+
+        # Timeouts
+        proxy_connect_timeout {{ proxy_connect_timeout | default('60s') }};
+        proxy_read_timeout {{ proxy_read_timeout | default('60s') }};
+        proxy_send_timeout {{ proxy_send_timeout | default('60s') }};
+    }
+
+    # Deny access to hidden files
+    location ~ /\. {
+        deny all;
+        access_log off;
+        log_not_found off;
+    }
+
+    # Logging
+    access_log /var/log/nginx/{{ app_name | default('django-app') }}_access.log;
+    error_log /var/log/nginx/{{ app_name | default('django-app') }}_error.log;
+}
+
+{% if enable_ssl | default(false) %}
+# HTTPS server block
+server {
+    listen 443 ssl http2;
+    server_name {{ server_name | default('_') }};
+
+    ssl_certificate {{ ssl_cert }};
+    ssl_certificate_key {{ ssl_key }};
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+    ssl_prefer_server_ciphers on;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 10m;
+
+    client_max_body_size {{ client_max_body_size | default('10m') }};
+
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-XSS-Protection "1; mode=block" always;
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+
+    location {{ static_url | default('/static/') }} {
+        alias {{ static_root | default('/opt/' + app_name | default('django-app') + '/static') }}/;
+        expires 30d;
+        add_header Cache-Control "public, immutable";
+        access_log off;
+    }
+
+    location {{ media_url | default('/media/') }} {
+        alias {{ media_root | default('/opt/' + app_name | default('django-app') + '/media') }}/;
+        expires 7d;
+        add_header Cache-Control "public";
+        access_log off;
+    }
+
+    location / {
+        proxy_pass http://{{ app_name | default('django-app') }}_server;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_redirect off;
+    }
+
+    location ~ /\. {
+        deny all;
+    }
+
+    access_log /var/log/nginx/{{ app_name | default('django-app') }}_ssl_access.log;
+    error_log /var/log/nginx/{{ app_name | default('django-app') }}_ssl_error.log;
+}
+
+# HTTP to HTTPS redirect
+server {
+    listen {{ listen_port | default(80) }};
+    server_name {{ server_name | default('_') }};
+    return 301 https://$host$request_uri;
+}
+{% endif %}

@@ -1,0 +1,214 @@
+---
+- name: Configure Automated Backups
+  hosts: all
+  become: true
+
+  vars:
+    backup_dirs:
+      - /var/www
+      - /etc/nginx
+      - /opt/app
+    backup_dest: /var/backups/automated
+    backup_schedule: "0 2 * * *"
+    retention_days: 30
+    s3_bucket: ""
+    s3_prefix: "backups/{{ inventory_hostname }}"
+    backup_user: root
+    compress: true
+    app_name: myapp
+
+  handlers:
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+  tasks:
+    # ========================================================================
+    # PREREQUISITES
+    # ========================================================================
+    - name: Install backup tools
+      ansible.builtin.apt:
+        name:
+          - rsync
+          - tar
+          - gzip
+          - pigz
+        state: present
+        update_cache: true
+      tags: [install]
+
+    - name: Install AWS CLI for S3 uploads
+      when: s3_bucket | length > 0
+      ansible.builtin.apt:
+        name: awscli
+        state: present
+      tags: [install]
+
+    # ========================================================================
+    # BACKUP DIRECTORIES
+    # ========================================================================
+    - name: Create backup destination directory
+      ansible.builtin.file:
+        path: "{{ backup_dest }}"
+        state: directory
+        owner: "{{ backup_user }}"
+        group: "{{ backup_user }}"
+        mode: "0750"
+      tags: [setup]
+
+    - name: Create backup log directory
+      ansible.builtin.file:
+        path: /var/log/backups
+        state: directory
+        owner: "{{ backup_user }}"
+        mode: "0750"
+      tags: [setup]
+
+    # ========================================================================
+    # BACKUP SCRIPT
+    # ========================================================================
+    - name: Deploy backup script
+      ansible.builtin.copy:
+        dest: /usr/local/bin/automated-backup.sh
+        mode: "0750"
+        owner: "{{ backup_user }}"
+        content: |
+          #!/bin/bash
+          set -euo pipefail
+
+          # Configuration
+          BACKUP_DEST="{{ backup_dest }}"
+          RETENTION_DAYS="{{ retention_days }}"
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+          HOSTNAME=$(hostname)
+          BACKUP_FILE="${BACKUP_DEST}/${HOSTNAME}_${TIMESTAMP}.tar.gz"
+          LOG_FILE="/var/log/backups/backup_${TIMESTAMP}.log"
+          S3_BUCKET="{{ s3_bucket }}"
+          S3_PREFIX="{{ s3_prefix }}"
+
+          log() {
+              echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
+          }
+
+          log "Starting backup..."
+
+          # Create backup archive
+          DIRS_TO_BACKUP=""
+          {% for dir in backup_dirs %}
+          if [ -d "{{ dir }}" ]; then
+              DIRS_TO_BACKUP="$DIRS_TO_BACKUP {{ dir }}"
+          else
+              log "WARNING: Directory {{ dir }} does not exist, skipping"
+          fi
+          {% endfor %}
+
+          if [ -z "$DIRS_TO_BACKUP" ]; then
+              log "ERROR: No valid directories to backup"
+              exit 1
+          fi
+
+          {% if compress %}
+          tar -czf "$BACKUP_FILE" $DIRS_TO_BACKUP 2>> "$LOG_FILE"
+          {% else %}
+          tar -cf "${BACKUP_FILE%.gz}" $DIRS_TO_BACKUP 2>> "$LOG_FILE"
+          BACKUP_FILE="${BACKUP_FILE%.gz}"
+          {% endif %}
+
+          BACKUP_SIZE=$(du -h "$BACKUP_FILE" | cut -f1)
+          log "Backup created: $BACKUP_FILE ($BACKUP_SIZE)"
+
+          # Upload to S3 if configured
+          if [ -n "$S3_BUCKET" ]; then
+              log "Uploading to s3://${S3_BUCKET}/${S3_PREFIX}/"
+              aws s3 cp "$BACKUP_FILE" "s3://${S3_BUCKET}/${S3_PREFIX}/$(basename $BACKUP_FILE)" 2>> "$LOG_FILE"
+              log "S3 upload complete"
+          fi
+
+          # Cleanup old backups
+          log "Removing backups older than ${RETENTION_DAYS} days..."
+          find "$BACKUP_DEST" -name "${HOSTNAME}_*.tar*" -mtime +${RETENTION_DAYS} -delete 2>> "$LOG_FILE"
+          find /var/log/backups -name "backup_*.log" -mtime +${RETENTION_DAYS} -delete 2>> "$LOG_FILE"
+
+          # Cleanup old S3 backups
+          if [ -n "$S3_BUCKET" ]; then
+              CUTOFF_DATE=$(date -d "-${RETENTION_DAYS} days" +%Y-%m-%d)
+              aws s3 ls "s3://${S3_BUCKET}/${S3_PREFIX}/" | while read -r line; do
+                  FILE_DATE=$(echo "$line" | awk '{print $1}')
+                  FILE_NAME=$(echo "$line" | awk '{print $4}')
+                  if [[ "$FILE_DATE" < "$CUTOFF_DATE" ]] && [ -n "$FILE_NAME" ]; then
+                      aws s3 rm "s3://${S3_BUCKET}/${S3_PREFIX}/$FILE_NAME"
+                      log "Removed old S3 backup: $FILE_NAME"
+                  fi
+              done
+          fi
+
+          log "Backup completed successfully"
+      tags: [script]
+
+    # ========================================================================
+    # SYSTEMD TIMER (replaces cron)
+    # ========================================================================
+    - name: Create backup systemd service
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/automated-backup.service
+        content: |
+          [Unit]
+          Description=Automated Backup Service
+          After=network.target
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/bin/automated-backup.sh
+          User={{ backup_user }}
+          StandardOutput=journal
+          StandardError=journal
+        mode: "0644"
+      notify: Reload systemd
+      tags: [timer]
+
+    - name: Create backup systemd timer
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/automated-backup.timer
+        content: |
+          [Unit]
+          Description=Run Automated Backup Daily
+
+          [Timer]
+          OnCalendar=*-*-* 02:00:00
+          RandomizedDelaySec=900
+          Persistent=true
+
+          [Install]
+          WantedBy=timers.target
+        mode: "0644"
+      notify: Reload systemd
+      tags: [timer]
+
+    - name: Enable and start backup timer
+      ansible.builtin.systemd:
+        name: automated-backup.timer
+        state: started
+        enabled: true
+        daemon_reload: true
+      tags: [timer]
+
+    # ========================================================================
+    # VERIFICATION
+    # ========================================================================
+    - name: Verify backup script is executable
+      ansible.builtin.stat:
+        path: /usr/local/bin/automated-backup.sh
+      register: backup_script
+      tags: [verify]
+
+    - name: Display backup configuration
+      ansible.builtin.debug:
+        msg: |
+          Backup configured on {{ inventory_hostname }}:
+          Directories: {{ backup_dirs | join(', ') }}
+          Destination: {{ backup_dest }}
+          S3 Bucket: {{ s3_bucket | default('Not configured', true) }}
+          Retention: {{ retention_days }} days
+          Schedule: Daily at 02:00 (with up to 15min jitter)
+          Script: /usr/local/bin/automated-backup.sh
+      tags: [verify]

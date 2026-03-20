@@ -1,0 +1,36 @@
+[Unit]
+Description={{ app_name }} Scala Play Framework Application
+After=network.target
+
+[Service]
+Type=simple
+User={{ app_user | default(app_name) }}
+Group={{ app_user | default(app_name) }}
+WorkingDirectory={{ app_dir }}
+ExecStart={{ app_dir }}/bin/{{ app_name }} -Dhttp.port={{ app_port | default(9000) }} -Dplay.http.secret.key={{ play_secret }}
+Restart=always
+RestartSec=10
+SuccessExitStatus=143
+
+# JVM options
+Environment="JAVA_OPTS={{ java_opts | default('-Xmx512m -Xms256m') }}"
+{% if db_url is defined %}
+Environment="DATABASE_URL={{ db_url }}"
+{% endif %}
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier={{ app_name }}
+
+# Security
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+
+# JVM resource limits
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

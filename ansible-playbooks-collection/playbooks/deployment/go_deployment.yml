@@ -1,0 +1,244 @@
+---
+# Playbook: Deploy Go Application
+# Description: Deploys a pre-built Go binary, configures systemd service with
+#              environment variables, and sets up Nginx reverse proxy.
+# Requirements: Ubuntu 22.04 target hosts, pre-built Go binary available
+# Tags: go, golang, deploy, application
+
+- name: Deploy Go Application
+  hosts: all
+  become: true
+
+  vars:
+    app_name: "goapp"
+    app_dir: "/opt/{{ app_name }}"
+    app_port: 8080
+    app_user: "goapp"
+    binary_source: ""
+    binary_name: "{{ app_name }}"
+    server_name: "_"
+    log_dir: "/var/log/{{ app_name }}"
+    app_env:
+      APP_ENV: "production"
+      APP_PORT: "{{ app_port }}"
+
+  handlers:
+    - name: Restart {{ app_name }}
+      ansible.builtin.systemd:
+        name: "{{ app_name }}"
+        state: restarted
+        daemon_reload: true
+      listen: "restart app"
+
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+      listen: "reload systemd"
+
+    - name: Reload nginx
+      ansible.builtin.systemd:
+        name: nginx
+        state: reloaded
+      listen: "reload nginx"
+
+    - name: Restart nginx
+      ansible.builtin.systemd:
+        name: nginx
+        state: restarted
+      listen: "restart nginx"
+
+  tasks:
+    # ------------------------------------------------------------------
+    # System dependencies
+    # ------------------------------------------------------------------
+    - name: Install system dependencies
+      tags:
+        - setup
+        - packages
+      block:
+        - name: Update apt cache
+          ansible.builtin.apt:
+            update_cache: true
+            cache_valid_time: 3600
+
+        - name: Install Nginx
+          ansible.builtin.apt:
+            name:
+              - nginx
+            state: present
+
+    # ------------------------------------------------------------------
+    # Application user and directories
+    # ------------------------------------------------------------------
+    - name: Configure application user and directories
+      tags:
+        - setup
+        - user
+      block:
+        - name: Create application user
+          ansible.builtin.user:
+            name: "{{ app_user }}"
+            system: true
+            shell: /usr/sbin/nologin
+            home: "{{ app_dir }}"
+            create_home: false
+
+        - name: Create application and log directories
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: directory
+            owner: "{{ app_user }}"
+            group: "{{ app_user }}"
+            mode: "0755"
+          loop:
+            - "{{ app_dir }}"
+            - "{{ app_dir }}/bin"
+            - "{{ app_dir }}/config"
+            - "{{ log_dir }}"
+
+    # ------------------------------------------------------------------
+    # Application deployment
+    # ------------------------------------------------------------------
+    - name: Deploy Go application binary
+      tags:
+        - deploy
+      block:
+        - name: Copy binary to server (from local)
+          ansible.builtin.copy:
+            src: "{{ binary_source }}"
+            dest: "{{ app_dir }}/bin/{{ binary_name }}"
+            owner: "{{ app_user }}"
+            group: "{{ app_user }}"
+            mode: "0755"
+          when: binary_source is not match("^https?://")
+          notify: "restart app"
+
+        - name: Download binary from URL
+          ansible.builtin.get_url:
+            url: "{{ binary_source }}"
+            dest: "{{ app_dir }}/bin/{{ binary_name }}"
+            owner: "{{ app_user }}"
+            group: "{{ app_user }}"
+            mode: "0755"
+          when: binary_source is match("^https?://")
+          notify: "restart app"
+
+        - name: Ensure binary has executable permissions
+          ansible.builtin.file:
+            path: "{{ app_dir }}/bin/{{ binary_name }}"
+            owner: "{{ app_user }}"
+            group: "{{ app_user }}"
+            mode: "0755"
+
+        - name: Deploy environment file
+          ansible.builtin.template:
+            src: go_app.env.j2
+            dest: "{{ app_dir }}/config/{{ app_name }}.env"
+            owner: "{{ app_user }}"
+            group: "{{ app_user }}"
+            mode: "0640"
+          notify: "restart app"
+          when: false  # Enable when template is available
+
+        - name: Deploy environment file (inline)
+          ansible.builtin.copy:
+            content: |
+              {% for key, value in app_env.items() %}
+              {{ key }}={{ value }}
+              {% endfor %}
+            dest: "{{ app_dir }}/config/{{ app_name }}.env"
+            owner: "{{ app_user }}"
+            group: "{{ app_user }}"
+            mode: "0640"
+          notify: "restart app"
+
+    # ------------------------------------------------------------------
+    # Systemd service
+    # ------------------------------------------------------------------
+    - name: Configure Go application systemd service
+      tags:
+        - service
+        - systemd
+      block:
+        - name: Deploy systemd service unit for Go application
+          ansible.builtin.template:
+            src: go_app.service.j2
+            dest: "/etc/systemd/system/{{ app_name }}.service"
+            owner: root
+            group: root
+            mode: "0644"
+          notify:
+            - "reload systemd"
+            - "restart app"
+
+        - name: Enable and start Go application service
+          ansible.builtin.systemd:
+            name: "{{ app_name }}"
+            enabled: true
+            state: started
+            daemon_reload: true
+
+    # ------------------------------------------------------------------
+    # Nginx reverse proxy
+    # ------------------------------------------------------------------
+    - name: Configure Nginx reverse proxy
+      tags:
+        - nginx
+        - proxy
+      block:
+        - name: Remove default nginx site
+          ansible.builtin.file:
+            path: /etc/nginx/sites-enabled/default
+            state: absent
+          notify: "reload nginx"
+
+        - name: Deploy Nginx reverse proxy configuration
+          ansible.builtin.template:
+            src: go_nginx.conf.j2
+            dest: "/etc/nginx/sites-available/{{ app_name }}.conf"
+            owner: root
+            group: root
+            mode: "0644"
+          notify: "reload nginx"
+
+        - name: Enable Nginx site configuration
+          ansible.builtin.file:
+            src: "/etc/nginx/sites-available/{{ app_name }}.conf"
+            dest: "/etc/nginx/sites-enabled/{{ app_name }}.conf"
+            state: link
+          notify: "reload nginx"
+
+        - name: Validate Nginx configuration
+          ansible.builtin.command:
+            cmd: nginx -t
+          changed_when: false
+
+        - name: Ensure Nginx is enabled and running
+          ansible.builtin.systemd:
+            name: nginx
+            enabled: true
+            state: started
+
+    # ------------------------------------------------------------------
+    # Verification
+    # ------------------------------------------------------------------
+    - name: Verify Go application deployment
+      tags:
+        - verify
+      block:
+        - name: Wait for application to become available
+          ansible.builtin.uri:
+            url: "http://localhost:{{ app_port }}/"
+            method: GET
+            status_code:
+              - 200
+              - 301
+              - 302
+          register: health_check
+          retries: 10
+          delay: 3
+          until: health_check is not failed
+
+        - name: Display deployment result
+          ansible.builtin.debug:
+            msg: "{{ app_name }} (Go) deployed successfully on port {{ app_port }}"

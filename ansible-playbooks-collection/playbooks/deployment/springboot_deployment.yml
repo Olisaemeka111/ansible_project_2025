@@ -1,0 +1,234 @@
+---
+# Playbook: Deploy Spring Boot Application
+# Description: Installs OpenJDK 17, deploys a Spring Boot JAR with configurable
+#              JVM options, and sets up Nginx reverse proxy.
+# Requirements: Ubuntu 22.04 target hosts, JAR artifact available
+# Tags: springboot, java, deploy, application
+
+- name: Deploy Spring Boot Application
+  hosts: all
+  become: true
+
+  vars:
+    app_name: "springapp"
+    app_dir: "/opt/{{ app_name }}"
+    app_port: 8080
+    app_user: "springapp"
+    jar_source: ""
+    jar_name: "{{ app_name }}.jar"
+    java_opts: "-Xmx512m -Xms256m"
+    spring_profiles_active: "production"
+    server_name: "_"
+    management_port: 8081
+    log_dir: "/var/log/{{ app_name }}"
+    java_package: "openjdk-17-jre-headless"
+
+  handlers:
+    - name: Restart {{ app_name }}
+      ansible.builtin.systemd:
+        name: "{{ app_name }}"
+        state: restarted
+        daemon_reload: true
+      listen: "restart app"
+
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+      listen: "reload systemd"
+
+    - name: Reload nginx
+      ansible.builtin.systemd:
+        name: nginx
+        state: reloaded
+      listen: "reload nginx"
+
+    - name: Restart nginx
+      ansible.builtin.systemd:
+        name: nginx
+        state: restarted
+      listen: "restart nginx"
+
+  tasks:
+    # ------------------------------------------------------------------
+    # Java installation
+    # ------------------------------------------------------------------
+    - name: Install Java Runtime Environment
+      tags:
+        - setup
+        - java
+      block:
+        - name: Update apt cache
+          ansible.builtin.apt:
+            update_cache: true
+            cache_valid_time: 3600
+
+        - name: Install OpenJDK 17 JRE and dependencies
+          ansible.builtin.apt:
+            name:
+              - "{{ java_package }}"
+              - nginx
+            state: present
+
+        - name: Verify Java installation
+          ansible.builtin.command:
+            cmd: java -version
+          register: java_version
+          changed_when: false
+
+        - name: Display Java version
+          ansible.builtin.debug:
+            msg: "{{ java_version.stderr_lines }}"
+
+    # ------------------------------------------------------------------
+    # Application user and directories
+    # ------------------------------------------------------------------
+    - name: Configure application user and directories
+      tags:
+        - setup
+        - user
+      block:
+        - name: Create application user
+          ansible.builtin.user:
+            name: "{{ app_user }}"
+            system: true
+            shell: /usr/sbin/nologin
+            home: "{{ app_dir }}"
+            create_home: false
+
+        - name: Create application and log directories
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: directory
+            owner: "{{ app_user }}"
+            group: "{{ app_user }}"
+            mode: "0755"
+          loop:
+            - "{{ app_dir }}"
+            - "{{ app_dir }}/config"
+            - "{{ log_dir }}"
+
+    # ------------------------------------------------------------------
+    # Application deployment
+    # ------------------------------------------------------------------
+    - name: Deploy Spring Boot application
+      tags:
+        - deploy
+      block:
+        - name: Copy JAR file to application directory
+          ansible.builtin.copy:
+            src: "{{ jar_source }}"
+            dest: "{{ app_dir }}/{{ jar_name }}"
+            owner: "{{ app_user }}"
+            group: "{{ app_user }}"
+            mode: "0644"
+          when: jar_source is not match("^https?://")
+          notify: "restart app"
+
+        - name: Download JAR file from URL
+          ansible.builtin.get_url:
+            url: "{{ jar_source }}"
+            dest: "{{ app_dir }}/{{ jar_name }}"
+            owner: "{{ app_user }}"
+            group: "{{ app_user }}"
+            mode: "0644"
+          when: jar_source is match("^https?://")
+          notify: "restart app"
+
+        - name: Deploy application configuration (application.yml)
+          ansible.builtin.template:
+            src: application.yml.j2
+            dest: "{{ app_dir }}/config/application.yml"
+            owner: "{{ app_user }}"
+            group: "{{ app_user }}"
+            mode: "0640"
+          notify: "restart app"
+          when: false  # Enable when template is available
+
+    # ------------------------------------------------------------------
+    # Systemd service
+    # ------------------------------------------------------------------
+    - name: Configure Spring Boot systemd service
+      tags:
+        - service
+        - systemd
+      block:
+        - name: Deploy systemd service unit for Spring Boot
+          ansible.builtin.template:
+            src: springboot.service.j2
+            dest: "/etc/systemd/system/{{ app_name }}.service"
+            owner: root
+            group: root
+            mode: "0644"
+          notify:
+            - "reload systemd"
+            - "restart app"
+
+        - name: Enable and start Spring Boot service
+          ansible.builtin.systemd:
+            name: "{{ app_name }}"
+            enabled: true
+            state: started
+            daemon_reload: true
+
+    # ------------------------------------------------------------------
+    # Nginx reverse proxy
+    # ------------------------------------------------------------------
+    - name: Configure Nginx reverse proxy
+      tags:
+        - nginx
+        - proxy
+      block:
+        - name: Remove default nginx site
+          ansible.builtin.file:
+            path: /etc/nginx/sites-enabled/default
+            state: absent
+          notify: "reload nginx"
+
+        - name: Deploy Nginx reverse proxy configuration
+          ansible.builtin.template:
+            src: springboot_nginx.conf.j2
+            dest: "/etc/nginx/sites-available/{{ app_name }}.conf"
+            owner: root
+            group: root
+            mode: "0644"
+          notify: "reload nginx"
+
+        - name: Enable Nginx site configuration
+          ansible.builtin.file:
+            src: "/etc/nginx/sites-available/{{ app_name }}.conf"
+            dest: "/etc/nginx/sites-enabled/{{ app_name }}.conf"
+            state: link
+          notify: "reload nginx"
+
+        - name: Validate Nginx configuration
+          ansible.builtin.command:
+            cmd: nginx -t
+          changed_when: false
+
+        - name: Ensure Nginx is enabled and running
+          ansible.builtin.systemd:
+            name: nginx
+            enabled: true
+            state: started
+
+    # ------------------------------------------------------------------
+    # Verification
+    # ------------------------------------------------------------------
+    - name: Verify Spring Boot deployment
+      tags:
+        - verify
+      block:
+        - name: Wait for application to become available
+          ansible.builtin.uri:
+            url: "http://localhost:{{ app_port }}/actuator/health"
+            method: GET
+            status_code:
+              - 200
+          register: health_check
+          retries: 20
+          delay: 5
+          until: health_check is not failed
+
+        - name: Display deployment result
+          ansible.builtin.debug:
+            msg: "{{ app_name }} (Spring Boot) deployed successfully on port {{ app_port }}"

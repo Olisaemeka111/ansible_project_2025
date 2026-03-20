@@ -1,0 +1,311 @@
+---
+# Ansible Playbook: BIND9 DNS Server Configuration
+# Installs and configures BIND9 with forward and reverse zones.
+# Usage: ansible-playbook dns_configuration.yml --limit dns_servers
+
+- name: Install and configure BIND9 DNS server
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    domain_name: "example.com"
+    dns_listen_address: "any"
+    dns_allow_query: "any"
+    dns_forwarders:
+      - "8.8.8.8"
+      - "8.8.4.4"
+    dns_recursion: true
+    dns_dnssec_validation: "auto"
+    dns_zone_type: "master"
+    dns_serial: "{{ ansible_date_time.epoch }}"
+    dns_refresh: 3600
+    dns_retry: 600
+    dns_expire: 604800
+    dns_minimum_ttl: 86400
+    dns_ttl: 86400
+    dns_admin_email: "admin.{{ domain_name }}"
+    dns_primary_ns: "ns1.{{ domain_name }}"
+    dns_secondary_ns: "ns2.{{ domain_name }}"
+    dns_network_prefix: "10.0.1"
+    dns_reverse_zone: "1.0.10"
+    zone_records:
+      - name: "@"
+        type: "A"
+        value: "10.0.1.10"
+      - name: "ns1"
+        type: "A"
+        value: "10.0.1.10"
+      - name: "ns2"
+        type: "A"
+        value: "10.0.1.11"
+      - name: "www"
+        type: "A"
+        value: "10.0.1.20"
+      - name: "mail"
+        type: "A"
+        value: "10.0.1.30"
+      - name: "@"
+        type: "MX"
+        value: "10 mail.{{ domain_name }}."
+    reverse_records:
+      - name: "10"
+        type: "PTR"
+        value: "ns1.{{ domain_name }}."
+      - name: "11"
+        type: "PTR"
+        value: "ns2.{{ domain_name }}."
+      - name: "20"
+        type: "PTR"
+        value: "www.{{ domain_name }}."
+      - name: "30"
+        type: "PTR"
+        value: "mail.{{ domain_name }}."
+
+  handlers:
+    - name: Restart bind9 service
+      ansible.builtin.systemd:
+        name: named
+        state: restarted
+
+    - name: Reload bind9 service
+      ansible.builtin.systemd:
+        name: named
+        state: reloaded
+
+    - name: Check bind9 configuration
+      ansible.builtin.command:
+        cmd: named-checkconf
+      changed_when: false
+      listen: "validate bind9 config"
+
+    - name: Check forward zone
+      ansible.builtin.command:
+        cmd: "named-checkzone {{ domain_name }} /etc/bind/zones/db.{{ domain_name }}"
+      changed_when: false
+      listen: "validate bind9 config"
+
+  tasks:
+    - name: Install BIND9
+      tags: [install]
+      block:
+        - name: Update apt cache
+          ansible.builtin.apt:
+            update_cache: true
+            cache_valid_time: 3600
+
+        - name: Install BIND9 packages
+          ansible.builtin.apt:
+            name:
+              - bind9
+              - bind9-utils
+              - bind9-dnsutils
+              - bind9-doc
+            state: present
+
+    - name: Configure BIND9 options
+      tags: [configure]
+      block:
+        - name: Deploy BIND9 named.conf.options
+          ansible.builtin.copy:
+            content: |
+              // BIND9 Options Configuration
+              // Managed by Ansible - do not edit manually
+
+              acl "trusted" {
+                  localhost;
+                  localnets;
+                  {{ dns_network_prefix }}.0/24;
+              };
+
+              options {
+                  directory "/var/cache/bind";
+
+                  // Listen on
+                  listen-on { {{ dns_listen_address }}; };
+                  listen-on-v6 { any; };
+
+                  // Query settings
+                  allow-query { {{ dns_allow_query }}; };
+                  allow-query-cache { trusted; };
+                  allow-transfer { none; };
+
+                  // Recursion
+                  recursion {{ 'yes' if dns_recursion else 'no' }};
+                  allow-recursion { trusted; };
+
+                  // Forwarders
+                  forwarders {
+              {% for forwarder in dns_forwarders %}
+                      {{ forwarder }};
+              {% endfor %}
+                  };
+                  forward only;
+
+                  // DNSSEC
+                  dnssec-validation {{ dns_dnssec_validation }};
+
+                  // Security
+                  version "not disclosed";
+                  hostname none;
+                  server-id none;
+
+                  // Performance
+                  minimal-responses yes;
+
+                  // Logging
+                  querylog no;
+              };
+            dest: /etc/bind/named.conf.options
+            owner: root
+            group: bind
+            mode: "0644"
+            validate: "named-checkconf %s || true"
+          notify:
+            - "validate bind9 config"
+            - Restart bind9 service
+
+    - name: Configure BIND9 local zones
+      tags: [configure]
+      block:
+        - name: Deploy named.conf.local with zone definitions
+          ansible.builtin.copy:
+            content: |
+              // BIND9 Local Zone Configuration
+              // Managed by Ansible - do not edit manually
+
+              // Forward Zone
+              zone "{{ domain_name }}" {
+                  type {{ dns_zone_type }};
+                  file "/etc/bind/zones/db.{{ domain_name }}";
+                  allow-update { none; };
+              };
+
+              // Reverse Zone
+              zone "{{ dns_reverse_zone }}.in-addr.arpa" {
+                  type {{ dns_zone_type }};
+                  file "/etc/bind/zones/db.{{ dns_reverse_zone }}";
+                  allow-update { none; };
+              };
+            dest: /etc/bind/named.conf.local
+            owner: root
+            group: bind
+            mode: "0644"
+          notify:
+            - "validate bind9 config"
+            - Restart bind9 service
+
+    - name: Create zone files
+      tags: [configure, zones]
+      block:
+        - name: Create zones directory
+          ansible.builtin.file:
+            path: /etc/bind/zones
+            state: directory
+            owner: root
+            group: bind
+            mode: "0755"
+
+        - name: Deploy forward zone file
+          ansible.builtin.copy:
+            content: |
+              ; Forward Zone File for {{ domain_name }}
+              ; Managed by Ansible - do not edit manually
+              $TTL    {{ dns_ttl }}
+              @       IN      SOA     {{ dns_primary_ns }}. {{ dns_admin_email }}. (
+                                        {{ dns_serial }}  ; Serial
+                                        {{ dns_refresh }}  ; Refresh
+                                        {{ dns_retry }}    ; Retry
+                                        {{ dns_expire }}   ; Expire
+                                        {{ dns_minimum_ttl }} ) ; Negative Cache TTL
+
+              ; Name Servers
+              @       IN      NS      {{ dns_primary_ns }}.
+              @       IN      NS      {{ dns_secondary_ns }}.
+
+              ; Zone Records
+              {% for record in zone_records %}
+              {{ "%-15s" | format(record.name) }} IN      {{ "%-7s" | format(record.type) }} {{ record.value }}
+              {% endfor %}
+            dest: "/etc/bind/zones/db.{{ domain_name }}"
+            owner: root
+            group: bind
+            mode: "0644"
+          notify:
+            - "validate bind9 config"
+            - Reload bind9 service
+
+        - name: Deploy reverse zone file
+          ansible.builtin.copy:
+            content: |
+              ; Reverse Zone File for {{ dns_reverse_zone }}.in-addr.arpa
+              ; Managed by Ansible - do not edit manually
+              $TTL    {{ dns_ttl }}
+              @       IN      SOA     {{ dns_primary_ns }}. {{ dns_admin_email }}. (
+                                        {{ dns_serial }}  ; Serial
+                                        {{ dns_refresh }}  ; Refresh
+                                        {{ dns_retry }}    ; Retry
+                                        {{ dns_expire }}   ; Expire
+                                        {{ dns_minimum_ttl }} ) ; Negative Cache TTL
+
+              ; Name Servers
+              @       IN      NS      {{ dns_primary_ns }}.
+              @       IN      NS      {{ dns_secondary_ns }}.
+
+              ; PTR Records
+              {% for record in reverse_records %}
+              {{ "%-15s" | format(record.name) }} IN      {{ "%-7s" | format(record.type) }} {{ record.value }}
+              {% endfor %}
+            dest: "/etc/bind/zones/db.{{ dns_reverse_zone }}"
+            owner: root
+            group: bind
+            mode: "0644"
+          notify:
+            - "validate bind9 config"
+            - Reload bind9 service
+
+    - name: Start and enable BIND9 service
+      tags: [service]
+      ansible.builtin.systemd:
+        name: named
+        state: started
+        enabled: true
+
+    - name: Verify DNS configuration
+      tags: [verify]
+      block:
+        - name: Validate BIND9 configuration syntax
+          ansible.builtin.command:
+            cmd: named-checkconf
+          changed_when: false
+
+        - name: Validate forward zone file
+          ansible.builtin.command:
+            cmd: "named-checkzone {{ domain_name }} /etc/bind/zones/db.{{ domain_name }}"
+          changed_when: false
+          register: forward_zone_check
+
+        - name: Validate reverse zone file
+          ansible.builtin.command:
+            cmd: "named-checkzone {{ dns_reverse_zone }}.in-addr.arpa /etc/bind/zones/db.{{ dns_reverse_zone }}"
+          changed_when: false
+          register: reverse_zone_check
+
+        - name: Display zone validation results
+          ansible.builtin.debug:
+            msg:
+              - "Forward zone: {{ forward_zone_check.stdout }}"
+              - "Reverse zone: {{ reverse_zone_check.stdout }}"
+
+        - name: Test DNS resolution
+          ansible.builtin.command:
+            cmd: "dig @localhost {{ domain_name }} A +short"
+          changed_when: false
+          register: dns_test
+          retries: 3
+          delay: 5
+          until: dns_test.rc == 0
+
+        - name: Display DNS test result
+          ansible.builtin.debug:
+            msg: "DNS resolution for {{ domain_name }}: {{ dns_test.stdout }}"
