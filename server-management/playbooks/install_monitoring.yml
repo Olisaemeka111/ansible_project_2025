@@ -1,6 +1,47 @@
 ---
 # ============================================================================
-# PHASE 1: Install Node Exporter on ALL servers (metrics collection agent)
+# PHASE 1: Open DB tier egress temporarily for monitoring downloads
+# ============================================================================
+- name: Open DB Tier egress for monitoring downloads
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - ../vars/additional_packages.yml
+    - ../vars/security_groups_output.yml
+    - ../vars/output_vars.yml
+
+  tasks:
+    - name: Add temporary egress rules to DB tier SG
+      amazon.aws.ec2_group:
+        name: vprofile-db-tier-sg
+        description: "Database Tier - Restricted database servers (private subnets)"
+        vpc_id: "{{ vpc_id }}"
+        region: "{{ region }}"
+        purge_rules: false
+        purge_rules_egress: true
+        rules_egress:
+          - proto: udp
+            ports: [53]
+            cidr_ip: 0.0.0.0/0
+            rule_desc: "TEMP - DNS for monitoring install"
+          - proto: tcp
+            ports: [443]
+            cidr_ip: 0.0.0.0/0
+            rule_desc: "TEMP - HTTPS for monitoring install"
+          - proto: tcp
+            ports: [80]
+            cidr_ip: 0.0.0.0/0
+            rule_desc: "TEMP - HTTP for monitoring install"
+        state: present
+
+    - name: Display temporary egress status
+      ansible.builtin.debug:
+        msg: "[OPEN] DB tier egress temporarily opened for monitoring downloads"
+
+# ============================================================================
+# PHASE 2: Install Node Exporter on ALL servers (metrics collection agent)
 # ============================================================================
 - name: Install Node Exporter on All Servers
   hosts: web_tier:app_tier:db_tier
@@ -102,24 +143,35 @@
             msg: "Node Exporter running on {{ inventory_hostname }}:{{ node_exporter_port }}"
 
 # ============================================================================
-# PHASE 2: Open temporary DB tier egress for monitoring downloads
+# PHASE 3: Lock down DB tier egress after Node Exporter install
 # ============================================================================
-- name: Open DB Tier egress for monitoring setup
+- name: Lock down DB Tier egress after monitoring install
   hosts: localhost
   connection: local
   gather_facts: false
 
   vars_files:
-    - ../vars/additional_packages.yml
+    - ../vars/security_groups_output.yml
     - ../vars/output_vars.yml
 
   tasks:
-    - name: Add temporary egress for DB tier (already open from node_exporter)
+    - name: Remove temporary egress rules from DB tier SG
+      amazon.aws.ec2_group:
+        name: vprofile-db-tier-sg
+        description: "Database Tier - Restricted database servers (private subnets, no outbound)"
+        vpc_id: "{{ vpc_id }}"
+        region: "{{ region }}"
+        purge_rules: false
+        purge_rules_egress: true
+        rules_egress: []
+        state: present
+
+    - name: Display lockdown status
       ansible.builtin.debug:
-        msg: "DB tier egress handled by node_exporter installation phase"
+        msg: "[LOCKED] DB tier egress locked down after monitoring install"
 
 # ============================================================================
-# PHASE 3: Install cAdvisor on App Tier (container metrics)
+# PHASE 4: Install cAdvisor on App Tier (container metrics)
 # ============================================================================
 - name: Install cAdvisor on App Tier
   hosts: app_tier
@@ -155,7 +207,7 @@
             msg: "cAdvisor running on {{ inventory_hostname }}:{{ cadvisor_port }}"
 
 # ============================================================================
-# PHASE 4: Install Prometheus Server on app-01 (monitoring hub)
+# PHASE 5: Install Prometheus Server on app-01 (monitoring hub)
 # ============================================================================
 - name: Install Prometheus Server on App-01
   hosts: app_tier
@@ -350,7 +402,7 @@
             msg: "Prometheus running on {{ inventory_hostname }}:{{ prometheus_port }}"
 
 # ============================================================================
-# PHASE 5: Install Alertmanager on app-01
+# PHASE 6: Install Alertmanager on app-01
 # ============================================================================
 - name: Install Alertmanager on App-01
   hosts: app_tier
@@ -478,7 +530,7 @@
             msg: "Alertmanager running on {{ inventory_hostname }}:{{ alertmanager_port }}"
 
 # ============================================================================
-# PHASE 6: Install Grafana on app-01 (dashboards)
+# PHASE 7: Install Grafana on app-01 (dashboards)
 # ============================================================================
 - name: Install Grafana on App-01
   hosts: app_tier
@@ -493,16 +545,21 @@
         - grafana_enabled | default(false)
         - inventory_hostname == (groups['app_tier'] | sort | first)
       block:
-        - name: Add Grafana GPG key
-          ansible.builtin.apt_key:
-            url: https://apt.grafana.com/gpg.key
-            state: present
+        - name: Download Grafana GPG key to signed-by keyring
+          ansible.builtin.shell: |
+            curl -fsSL https://apt.grafana.com/gpg.key | gpg --dearmor -o /usr/share/keyrings/grafana-keyring.gpg
+            chmod 644 /usr/share/keyrings/grafana-keyring.gpg
 
-        - name: Add Grafana repository
-          ansible.builtin.apt_repository:
-            repo: "deb https://apt.grafana.com stable main"
-            state: present
-            filename: grafana
+        - name: Write Grafana repo file with signed-by
+          ansible.builtin.copy:
+            content: "deb [signed-by=/usr/share/keyrings/grafana-keyring.gpg] https://apt.grafana.com stable main\n"
+            dest: /etc/apt/sources.list.d/grafana.list
+            owner: root
+            group: root
+            mode: "0644"
+
+        - name: Update apt cache for Grafana repo
+          ansible.builtin.apt:
             update_cache: yes
 
         - name: Install Grafana
