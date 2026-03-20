@@ -9,6 +9,83 @@
 
   tasks:
     # ========================================================================
+    # PRE-TASK: Nuke ALL legacy apt keys and repo files, rebuild with signed-by
+    # Must complete BEFORE any apt update / apt install runs
+    # ========================================================================
+    - name: Remove all legacy apt-key entries and stale repo files
+      ansible.builtin.shell: |
+        # Remove ALL Jenkins repo files (any naming)
+        rm -f /etc/apt/sources.list.d/jenkins*.list
+        rm -f /etc/apt/sources.list.d/jenkins*.sources
+        # Remove ALL Docker repo files (any naming)
+        rm -f /etc/apt/sources.list.d/docker*.list
+        rm -f /etc/apt/sources.list.d/download_docker_com_linux_ubuntu.list
+        # Remove all legacy apt-key entries
+        apt-key del 5BA31D57EF5975CA 2>/dev/null || true
+        apt-key del 7198F4B714ABFC68 2>/dev/null || true
+        apt-key del 0EBFCD88 2>/dev/null || true
+        # Remove all old keyring files (force fresh download)
+        rm -f /usr/share/keyrings/jenkins-keyring.asc
+        rm -f /usr/share/keyrings/jenkins-keyring.gpg
+        rm -f /usr/share/keyrings/docker-archive-keyring.gpg
+        rm -f /etc/apt/trusted.gpg.d/jenkins*.gpg
+        rm -f /etc/apt/trusted.gpg.d/docker*.gpg
+      changed_when: true
+
+    - name: Download Docker GPG key to signed-by keyring
+      ansible.builtin.shell: |
+        curl -fsSL https://download.docker.com/linux/ubuntu/gpg | \
+          gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+        chmod 644 /usr/share/keyrings/docker-archive-keyring.gpg
+      when: docker_enabled | default(false)
+
+    - name: Write Docker repo file with signed-by
+      ansible.builtin.copy:
+        content: "deb [arch=amd64 signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable\n"
+        dest: /etc/apt/sources.list.d/docker.list
+        owner: root
+        group: root
+        mode: "0644"
+      when: docker_enabled | default(false)
+
+    - name: Fetch Jenkins GPG key from official URL and keyserver
+      ansible.builtin.shell: |
+        export GNUPGHOME=$(mktemp -d)
+        curl -fsSL https://pkg.jenkins.io/debian-stable/jenkins.io-2023.key | gpg --import 2>/dev/null || true
+        gpg --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys 7198F4B714ABFC68 2>/dev/null || true
+        gpg --export --output /usr/share/keyrings/jenkins-keyring.gpg
+        chmod 644 /usr/share/keyrings/jenkins-keyring.gpg
+        rm -rf "$GNUPGHOME"
+      when: jenkins_enabled | default(false)
+
+    - name: Verify Jenkins keyring file exists
+      ansible.builtin.stat:
+        path: /usr/share/keyrings/jenkins-keyring.gpg
+      register: jenkins_keyring
+      when: jenkins_enabled | default(false)
+
+    - name: Fail if Jenkins keyring not created
+      ansible.builtin.fail:
+        msg: "Failed to create Jenkins keyring at /usr/share/keyrings/jenkins-keyring.gpg"
+      when:
+        - jenkins_enabled | default(false)
+        - not jenkins_keyring.stat.exists
+
+    - name: Write Jenkins repo file with signed-by
+      ansible.builtin.copy:
+        content: "deb [signed-by=/usr/share/keyrings/jenkins-keyring.gpg] https://pkg.jenkins.io/debian-stable binary/\n"
+        dest: /etc/apt/sources.list.d/jenkins.list
+        owner: root
+        group: root
+        mode: "0644"
+      when: jenkins_enabled | default(false)
+
+    - name: Update apt cache after all repos are properly signed
+      ansible.builtin.apt:
+        update_cache: yes
+        cache_valid_time: 0
+
+    # ========================================================================
     # JENKINS
     # ========================================================================
     - name: Install Jenkins
@@ -18,54 +95,8 @@
           ansible.builtin.apt:
             name: "{{ jenkins_java_package }}"
             state: present
-            update_cache: yes
 
-        - name: Clean up all legacy Jenkins and Docker apt key entries
-          ansible.builtin.shell: |
-            # Remove stale Jenkins repo files (any format)
-            rm -f /etc/apt/sources.list.d/jenkins*.list
-            rm -f /etc/apt/sources.list.d/jenkins*.sources
-            # Remove old Jenkins keys from legacy keyring
-            apt-key del 5BA31D57EF5975CA 2>/dev/null || true
-            apt-key del 7198F4B714ABFC68 2>/dev/null || true
-            # Remove old Docker key from legacy keyring
-            apt-key del 0EBFCD88 2>/dev/null || true
-            # Remove stale keyring files
-            rm -f /usr/share/keyrings/jenkins-keyring.asc
-            rm -f /usr/share/keyrings/jenkins-keyring.gpg
-            rm -f /etc/apt/trusted.gpg.d/jenkins*.gpg
-          changed_when: true
-
-        - name: Fetch Jenkins GPG key and import from keyserver
-          ansible.builtin.shell: |
-            export GNUPGHOME=$(mktemp -d)
-            # Download the official Jenkins key
-            curl -fsSL https://pkg.jenkins.io/debian-stable/jenkins.io-2023.key | gpg --import 2>/dev/null || true
-            # Also fetch the new signing key from keyserver
-            gpg --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys 7198F4B714ABFC68 2>/dev/null || true
-            # Export all imported keys to the keyring file
-            gpg --export --output /usr/share/keyrings/jenkins-keyring.gpg
-            chmod 644 /usr/share/keyrings/jenkins-keyring.gpg
-            rm -rf "$GNUPGHOME"
-
-        - name: Verify Jenkins keyring file exists
-          ansible.builtin.stat:
-            path: /usr/share/keyrings/jenkins-keyring.gpg
-          register: jenkins_keyring
-
-        - name: Fail if Jenkins keyring not created
-          ansible.builtin.fail:
-            msg: "Failed to create Jenkins keyring at /usr/share/keyrings/jenkins-keyring.gpg"
-          when: not jenkins_keyring.stat.exists
-
-        - name: Add Jenkins repository with signed-by
-          ansible.builtin.apt_repository:
-            repo: "deb [signed-by=/usr/share/keyrings/jenkins-keyring.gpg] https://pkg.jenkins.io/debian-stable binary/"
-            state: present
-            filename: jenkins
-            update_cache: yes
-
-        - name: Install Jenkins
+        - name: Install Jenkins package
           ansible.builtin.apt:
             name: jenkins
             state: present
@@ -105,26 +136,6 @@
           register: docker_check
           changed_when: false
           ignore_errors: true
-
-        - name: Migrate Docker to signed-by keyring (fix legacy warning)
-          ansible.builtin.shell: |
-            # Download Docker GPG key to proper keyring location
-            curl -fsSL https://download.docker.com/linux/ubuntu/gpg | \
-              gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
-            chmod 644 /usr/share/keyrings/docker-archive-keyring.gpg
-            # Remove old Docker key from legacy keyring
-            apt-key del 0EBFCD88 2>/dev/null || true
-            # Remove old unsigned Docker repo entry
-            rm -f /etc/apt/sources.list.d/download_docker_com_linux_ubuntu.list
-          args:
-            creates: /usr/share/keyrings/docker-archive-keyring.gpg
-
-        - name: Ensure Docker repo uses signed-by
-          ansible.builtin.apt_repository:
-            repo: "deb [signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
-            state: present
-            filename: docker
-            update_cache: yes
 
         - name: Install Docker if not present
           when: docker_check.rc != 0
