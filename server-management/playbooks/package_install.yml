@@ -50,11 +50,42 @@
     - ../vars/packages.yml
 
   tasks:
+    # ------------------------------------------------------------------
+    # PRE-TASK: Clean up broken repos from previous runs before any apt update
+    # ------------------------------------------------------------------
+    - name: Clean up legacy apt-key entries and unsigned repo files
+      ansible.builtin.shell: |
+        # Remove ALL Docker repo files (any naming from previous runs)
+        rm -f /etc/apt/sources.list.d/docker*.list
+        rm -f /etc/apt/sources.list.d/download_docker_com_linux_ubuntu.list
+        # Remove Docker key from legacy keyring
+        apt-key del 0EBFCD88 2>/dev/null || true
+        # Remove old Docker keyring file (force fresh download)
+        rm -f /usr/share/keyrings/docker-archive-keyring.gpg
+      changed_when: true
+
+    - name: Download Docker GPG key to signed-by keyring
+      ansible.builtin.shell: |
+        curl -fsSL https://download.docker.com/linux/ubuntu/gpg | \
+          gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+        chmod 644 /usr/share/keyrings/docker-archive-keyring.gpg
+
+    - name: Write Docker repo file with signed-by
+      ansible.builtin.copy:
+        content: "deb [arch=amd64 signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable\n"
+        dest: /etc/apt/sources.list.d/docker.list
+        owner: root
+        group: root
+        mode: "0644"
+
     - name: Update apt cache
       ansible.builtin.apt:
         update_cache: yes
-        cache_valid_time: 3600
+        cache_valid_time: 0
 
+    # ------------------------------------------------------------------
+    # Package installation
+    # ------------------------------------------------------------------
     - name: Install common packages
       ansible.builtin.apt:
         name: "{{ packages_common }}"
@@ -97,7 +128,6 @@
           ansible.builtin.apt:
             name: nodejs
             state: present
-            update_cache: yes
 
     - name: Verify Node.js installation
       ansible.builtin.command: node --version
@@ -106,22 +136,10 @@
 
     - name: Install Docker CE and plugins
       block:
-        - name: Add Docker GPG key
-          ansible.builtin.apt_key:
-            url: https://download.docker.com/linux/ubuntu/gpg
-            state: present
-
-        - name: Add Docker repository
-          ansible.builtin.apt_repository:
-            repo: "deb https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
-            state: present
-            update_cache: yes
-
         - name: Install Docker packages
           ansible.builtin.apt:
             name: "{{ docker_packages }}"
             state: present
-            update_cache: yes
 
         - name: Start Docker service
           ansible.builtin.systemd:
